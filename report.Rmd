@@ -1,0 +1,16 @@
+---
+fontsize: 11pt
+geometry: margin=0.25in
+output:
+  pdf_document:
+    keep_tex: no
+    latex_engine: xelatex
+---
+
+```{r Everett, child = 'lib/Everett.Rmd'}
+```
+
+```{r Guilloux, child = 'lib/Guilloux.Rmd'}
+```
+
+

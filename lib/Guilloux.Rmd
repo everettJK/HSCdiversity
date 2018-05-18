@@ -1,0 +1,1568 @@
+---
+fontsize: 11pt
+geometry: margin=0.25in
+output:
+  html_document:
+    keep_md: yes
+  pdf_document:
+    keep_tex: yes
+    latex_engine: xelatex
+---
+
+```{r Choices, echo=FALSE, eval=TRUE, include=FALSE}
+##########################################################
+############# Choose the cutoff of IS abundance for the analysis ############
+##########################################################
+
+CUT = 2    
+
+###########################################################
+######## Put TRUE if you want to run the statistical test for clonal size ########
+########       /!\ takes a few hours /!\           ########
+###########################################################
+
+ALL_TEST= FALSE
+
+```
+
+```{r DataPrep, echo=FALSE, eval=TRUE, include=FALSE}
+
+########################################################################
+######################## DATA PREPARATION ##############################
+########################################################################
+
+###Loading the packages
+library(plyr)
+library(tidyverse)
+library(reshape2)
+library(pander)
+library(sqldf)
+library(lazyeval)
+library(lme4)
+library(psych)
+library(MASS)
+library(scales)
+library(gridExtra)
+library(ggtern)
+library(grid)
+library(knitr)
+library(gtools)
+
+##################################
+### Data loading and formatting  ###
+#################################
+
+intSites <- read.csv('../data/intSites_patientnames.csv', header = TRUE)
+
+for(i in c('start', 'end', 'width', 'estAbund')) intSites[[i]] <- as.numeric(intSites[[i]]) 
+
+#Load the correction function from another R script
+source('abundanceCorrections_3stepsV2.R')
+
+#
+# Read in the cell sorting cross over reports which are stored in a single file with records separated with '#%'.
+# The counts table is identifiable by the key word COUNTS. 
+#
+
+options(stringsAsFactors = FALSE)
+crossOverReports <- readChar('../data/crossOverReports.tsv', file.info('../data/crossOverReports.tsv')$size)
+crossOverReports <- unlist(strsplit(crossOverReports, '#%'))
+crossOverReports <- unlist(lapply(crossOverReports, function(x){
+  source     <- ifelse(grepl('#source:', x), sub('\\t+$', '', str_match(x, '#source:\\s+(.+)')[2]), '')
+  cellCounts <- as.numeric(str_match_all(str_match(x, 'initialCellCounts,(.+)')[2], '([\\d\\.]+)')[[1]][,2])
+  psort <- as.numeric(str_match_all(str_match(x, 'pB_postsort,(.+)')[2], '([\\d\\.]+)')[[1]][,2])
+  count_psort <-as.numeric(str_match_all(str_match(x, 'postsortCount,(.+)')[2], '([\\d\\.]+)')[[1]][,2])
+  VCN <-as.numeric(str_match_all(str_match(x, 'VCN,(.+)')[2], '([\\d\\.]+)')[[1]][,2])
+  patient    <- str_match(x, '#(\\S+)')[2]
+  timePoint  <- str_match(x, '#\\S+\\s+(\\S+)')[2]
+  t          <- gsub('\\t+\\n', '\n', substr(x, regexpr('COUNTS', x)+7, nchar(x)))
+  m          <- read.table(tc <- textConnection(t), header = TRUE, fill = TRUE, check.names = FALSE, sep='\t'); close(tc); 
+  if(nrow(m) < 5 | length(m) < 5) return(NA)
+  m <- m[1:5, 1:5]
+  r <- list()
+  r[[paste(patient, timePoint, source, sep='|')]] <- list(
+    patient   = str_match(x, '#(\\S+)\\s+(\\S+)')[2],
+    timePoint = str_match(x, '#(\\S+)\\s+(\\S+)')[3],
+    source    = source,
+    t         = t,
+    table     = m,
+    cellCount = cellCounts,
+    psort     = psort,
+    count_psort = count_psort,
+    VCN = VCN)
+  
+  message('Read in ', names(r))
+  r
+}), recursive = FALSE)
+
+crossOverReports <- crossOverReports[sapply(crossOverReports, is.list)]
+
+#
+# Subset the resulting list to include only those reports which will be used in the study.
+#
+
+samples <- c('FR01|m22|Blood', 'FR01|m48|Blood',
+             'FR03|m12|Blood', 'FR03|m36|Blood',
+             'FR04|m12_6|Blood', 'FR04|m36|Blood',
+             'FR05|m12|Blood','FR05|m30|Blood',
+             'p1202|m11|Blood','p1202|m36|Blood',
+             'p1204|m12|Blood', 'p1204|m24|Blood')
+
+if(! all(samples %in% names(crossOverReports))) stop('All the requested crossover tables were not found.')
+crossOverReports <- crossOverReports[samples]  
+
+
+#
+# For each cross over report entry, create a subset of the data, convert it into a matrix like structure, 
+# and apply a series of abundance corrections in the same manner as developed by Six and co. These corrections 
+# are returned to the crossover list of lists object. 
+# Column headers are reorganized to emulate Six and co's intput to their provided functions.
+#
+
+#
+# Create a key to be used to update corrected abundances.
+#
+
+intSites$key <- paste(intSites$posid, intSites$celltype, intSites$patient, intSites$timepoint)
+
+#Use the different abundance cutoff (here sup0 (> 0 cell by default) and sup2 (> 2 cells CUT chosen for the example))
+
+j=0
+for (cut in c(0,CUT)) {
+  j=j+1
+  
+  assign(paste('liste_intSites_new_sup',cut,sep=''),lapply(crossOverReports,function(x){  
+    if(x$source == 'BoneMarrow') names(x$table) <- paste0('BM_', names(x$table))
+    
+    # Subset the intSite data to include only sites from a specific cell type and time point.
+    i <- which(intSites$patient==x$patient & intSites$timepoint==x$timePoint & toupper(intSites$celltype) %in% toupper(names(x$table)))
+    d <- intSites[i,]
+    
+    if(nrow(d) == 0) stop(paste0(x$patient, ' / ', x$timePoint, ' could not be found in the intSite data.'))
+    
+    message('Cell types in retrieved data subset(', x$patient, ' - ', x$timePoint, '): ', paste0(unique(d$celltype), collapse=', '))
+    
+    # Replace NA gene names with 'NONE' in case Correction_CutData_new() is sensitive to NA.
+    if(length(which(is.na(d$nearestFeature))) > 0) d[which(is.na(d$nearestFeature)),]$nearestFeature <- 'NONE'
+    
+    # Reorganize the data to create an intSite / cell count table.
+    d2 <- reshape2::dcast(d, posid ~ celltype, value.var='estAbund', fun.aggregate=function(x){x[1]}, fill=0)  
+    
+    # Add missing cell types.
+    d2[names(x$table)[! toupper(names(x$table)) %in% toupper(names(d2))]] <- 0
+    
+    # Add nearest gene column.
+    d2$gene <- intSites[match(d2$posid, intSites$posid),]$nearestFeature  
+    
+    # Reorganize the column headers to match Correction_CutData_new() input structure.
+    d2 <- d2[,c(1,grep('gene',   names(d2), ignore.case = TRUE),
+                 grep('Bcell',  names(d2), ignore.case = TRUE),
+                 grep('Mono',   names(d2), ignore.case = TRUE),
+                 grep('Neutro', names(d2), ignore.case = TRUE),
+                 grep('NKcell', names(d2), ignore.case = TRUE),
+                 grep('Tcell',  names(d2), ignore.case = TRUE))]
+    
+    # Create a cell count column.
+    d2$cellCount <-  apply(d2, 1, function(x){ sum(as.integer(x[3:7])) })
+    d2 = dplyr::filter(d2,cellCount>cut)
+    
+    # Rename the input columns for Correction_CutData_new().
+    names(d2)=c("integrationSite", "gene", "Bcells", "Monocytes", "Neutrophils", "NKcells", "Tcells", "cellCount") 
+    
+    #
+    # Now the intSite data has been reorganized into a count like table and formatted for Correction_CutData_new(),
+    # replace all zeros in the crossover table with 0.1 and call Correction_CutData_new().
+    #
+    x$table[x$table == 0] <- 0.1
+    message('Correction input header:')
+    pander(head(d2, n=3))
+    correction <- Correction_CutData_new(d2, cut, as.matrix(x$table), x$cellCount, x$psort)
+    
+    # Rename the returned data frame to match the cell types in the intSites data frame.
+    n <- c("integrationSite", "gene", "Bcells_corrected", "Monocytes_corrected", "Neutrophils_corrected", "NKcells_corrected", "Tcells_corrected")
+    names(correction$Cut_data_corrected3) <- n
+    
+    m <- melt(correction$Cut_data_corrected3)
+    m$key <- paste(c(x$patient, x$timePoint,x$source),collapse = "|") 
+    m_spread = spread(m,variable,value)
+    intSites_new =dplyr::full_join( d2,m_spread,by=c('integrationSite','gene') )
+
+    # Add proportions.
+    prop = (intSites_new[,grepl("_corrected",names(intSites_new))])/rowSums((intSites_new[,grepl("_corrected",names(intSites_new))]))
+    names(prop) = c("Bcells_corrected_prop", "Monocytes_corrected_prop", "Neutrophils_corrected_prop", "NKcells_corrected_prop", "Tcells_corrected_prop")
+    intSites_new = cbind(intSites_new,prop)
+    return(intSites_new)
+  } ))
+  
+ #Get the data and name it automatically. 
+   if(CUT != 0){
+    x=ls(pattern = "liste_intSites_new.*")[j]} 
+  else {
+    x=ls(pattern = "liste_intSites_new.*")}
+ 
+  x=get(x)
+  x=do.call(rbind,x)
+  print(paste0('Nb of rows :',nrow(x)))
+  row.names(x)=NULL
+  assign(paste('intSites_new_concat_sup',cut,sep=''),x)
+  rm(x)
+} 
+
+
+###########################################
+### Functions used to apply the k-means clustering  ### 
+###########################################
+
+## apply CLR or logCLR correction
+Transformation <- function(data_prop_init,correction){
+  
+  data = data_prop_init[,grepl("_corrected_prop",colnames(data_prop_init))]
+  
+  Moyenne_Geo= geometric.mean(t(data)) 
+  dataprop_mg = round(data/Moyenne_Geo , 4)
+  
+  if (correction == "logCLR")  {
+    dataprop_logCLR = matrix(NA, nrow(data), ncol(data))
+    for(i in 1:nrow(data)) {
+      for(j in 1:ncol(data)) {
+        if (dataprop_mg[i,j]<=1)
+          dataprop_logCLR[i,j] = round(-log(1 - log(dataprop_mg[i,j]))^2 , 4)
+        else dataprop_logCLR[i,j] = round((log(dataprop_mg[i,j]))^2 ,4 )
+      }
+    }
+    VFdataprop_transf  = cbind(data_prop_init , dataprop_logCLR)
+  }
+  else{
+    VFdataprop_transf  = cbind(data_prop_init , log(dataprop_mg))
+  }
+  nom = names(data)
+  names(VFdataprop_transf) = c(names(data_prop_init),paste0(strsplit(nom,"_corrected_prop"),paste0("_transf_",correction)))
+  return(VFdataprop_transf)
+}
+
+#--------------------------------------------------#
+
+## from CLR or logCLR corrected data to proportions
+return_to_prop = function(tableau,transf="logCLR"){
+  n_clust = nrow(tableau)
+  n_cells = ncol(tableau)
+  tableau_prop = matrix(nrow=n_clust,ncol=(n_cells))
+  if (transf=="logCLR"){
+    for (i in 1:n_clust){
+      for (j in 1:n_cells){
+        if (tableau[i,j]>0){
+          tableau_prop[i,j] = exp( sqrt(tableau[i,j]) )}
+        if (tableau[i,j]<=0){
+          tableau_prop[i,j] = exp(1 - exp( sqrt(-tableau[i,j])))}
+      }
+      tableau_prop[i,] = tableau_prop[i,] / sum(tableau_prop[i,])
+    }
+  }
+  if (transf=="CLR"){
+    for (i in 1:n_clust){
+      for (j in 1:n_cells){
+        tableau_prop[i,j] = exp( tableau[i,j]) }
+      tableau_prop[i,] = tableau_prop[i,] / sum(tableau_prop[i,])            
+    }
+  }
+  tableau_prop = data.frame(tableau_prop)
+  names(tableau_prop) = names(tableau)
+  return(tableau_prop)
+}
+
+#--------------------------------------------------#
+
+
+############################
+### clustering by Kmeans ###
+############################
+
+KmeansClustering = function(data,transf="logCLR",scaling="FALSE",elbow = "TRUE"){
+  
+  ###Seed for reproducible results
+  set.seed(321)
+  
+  # --- Data transformation --- # 
+  data_transformed = Transformation(data,transf)
+  
+  data_clustering = data_transformed[,grepl("_transf",names(data_transformed))] 
+  if (scaling == TRUE){
+    data_clustering <- as.matrix(scale(data_clustering)) 
+  }
+  
+  
+  # --- Choice of the nb of clusters --- # 
+  #Find the optimal number of clusters with 2 methods 
+  if (elbow == TRUE){
+    # Compute bss (var between the clusters), tss (var total), Rsquare values for k = 1 to k = 15 clusters.
+    k.max <- 15
+    resk <- sapply(1:k.max, 
+            function(k){kmeans(data_clustering, k, nstart=50,iter.max = 15)})
+    
+    bss=unlist(resk["betweenss",])
+    tss=unlist(resk["totss",])
+    Rsquare = bss/tss   #(1) Will be plot later for the elbow criterion
+   
+    n = nrow(data_clustering)
+    d = ncol(data_clustering)
+    pen = sqrt(n*d*(1:k.max))
+    contrast =(1-bss/tss)
+    nbclust_estim=which.min(contrast+(2/n)*pen) #(2) Estimation of the optimal nb of clusters 
+    print(nbclust_estim)
+  }
+  # --------------------- #
+  
+  
+  # --- Clustering --- # # Clusterize data with the best k 
+  nbclust=nbclust_estim
+  
+  #change the number of clusters if the patient is BetaS/BetaS (7 clusters for more accurate results)
+  if (unique(data$key) == 'p1204|m24|Blood') {nbclust=7}
+  
+  #use the kmeans algorithm
+  clust = kmeans(data_clustering, nbclust, nstart=50, iter.max = 15)
+  # ------------------ #
+  
+  ### save data in intSites_withKmeans
+  intSites_withKmeans = data_transformed
+  intSites_withKmeans$cluster_num = clust$cluster
+  
+  ### save clusters centers into a file order by abundance
+  prop = return_to_prop(clust$centers)
+  nom = names(data_clustering)
+  names(prop) = paste0(strsplit(nom,paste0("_transf_",transf)),"_prop")
+  tableau = data.frame(cbind(clust$centers,prop))
+  
+  tableau = dplyr::mutate(tableau,abundance = clust$size)
+  tableau = dplyr::mutate(tableau,clust_num = c(1:nbclust))
+  tableau$key = unique(data$key)
+  tableau = arrange(tableau,-abundance)
+  
+  # --- calculate the distances between the centroids and the blood characteristics--- #
+  ## Kullback-Leibler Distance
+  kl = function(prop1, prop2){
+    sum(prop1 * log(prop1/prop2))
+  }
+  
+  ##Data preparation
+  celltypes = c('G','M','B','K','T')
+  compositions = list()     
+  
+  key=unique(data$key) 
+  tableau = tableau 
+  clus = tableau$clust_num
+  tableau_dis = tableau[,grepl("_prop",colnames(tableau))]
+  tableau_dis=tableau_dis[c(3,2,1,4,5)] #change the order of the cell types (GMBKT)
+  
+  initial_comp = crossOverReports[[key]]$cellCount[c(3,2,1,4,5)] #change the order of the cell types (GMBKT)
+  initial_comp = initial_comp/sum(initial_comp)
+  
+  nom = paste(celltypes,collapse = "")
+  compositions[[nom]] = initial_comp
+  
+  ##Create the different blood references composition (GMBKT,GMBK,GMBT...,K,T)
+  for (m in 1:4){
+    aeffacer = combn(1:5,m)
+    for (k in 1:ncol(aeffacer)){
+      comp = initial_comp
+      comp[aeffacer[,k]] = initial_comp[aeffacer[,k]]/1000
+      comp = comp / sum(comp)
+      nom = paste(celltypes[-aeffacer[,k]],collapse = "")
+      compositions[[nom]] = comp
+    }
+  }
+  
+  ##Calculation of the distances
+  distances = matrix(ncol=nbclust,nrow=length(compositions))
+  rownames(distances) = names(compositions)
+  colnames(distances) = clus
+  for (i in 1:nrow(tableau_dis)){
+    distances[,i] = unlist(lapply(compositions,kl,tableau_dis[i,]))
+  }
+  
+  distances = as.data.frame(distances)
+  distances$key=rep(key,nrow(distances))
+  distances$distance =  names(compositions)
+  distances = melt(distances,id=c('key','distance'))
+  
+  ##Find the closest reference composition to the cluster centroid
+  dist_min=distances %>% 
+    group_by(.dots=c('key','variable')) %>% 
+      slice(which.min(value))
+  
+  ##Define the name of each cluster according to its closest reference
+  cluster = rep(NA,nbclust)
+  for (i in 1:nrow(tableau)){
+    cluster[i] = dist_min$distance[unique(dist_min$key)==unique(tableau$key) & dist_min$variable==tableau$clust_num][i] 
+  }
+  tableau$cluster = cluster
+  # ----------------------------------------------------------------------------------------------------------- #
+  
+  ##save the clusters names in intSites_withKmeans
+  intSites_withKmeans = dplyr::mutate(intSites_withKmeans , 
+                               cluster = plyr::mapvalues(cluster_num, 
+                                                         from = tableau$clust_num, 
+                                                         to = tableau$cluster))
+  
+  ##Return the results
+  return(list(tableau=tableau ,
+              intSites_withKmeans = intSites_withKmeans , 
+              R2 = (clust$betweenss/clust$totss)*100,
+              elbow = Rsquare,
+              nbclust_estim=nbclust_estim))
+}
+
+##############################################
+### Apply the clustering to the patient   ### 
+##############################################
+
+use_kmeans=function(cut,s){
+  k=NULL
+  v=get(paste('liste_intSites_new_sup',cut,sep=''))[samples]
+  k=llply(v,function(x){KmeansClustering(x)})
+  return(k)
+}
+
+##Create a list with the kmeans results for the samples and cutoff chosen [here sup2]
+
+samples <- c('FR01|m22|Blood', 'FR01|m48|Blood',
+             'FR03|m12|Blood', 'FR03|m36|Blood',
+             'FR04|m12_6|Blood', 'FR04|m36|Blood',
+             'FR05|m30|Blood',
+             'p1202|m11|Blood','p1202|m36|Blood',
+             'p1204|m12|Blood', 'p1204|m24|Blood')
+
+#kmeans for cutoff > CUT
+liste_kmeans_results=use_kmeans(cut=CUT,s=samples)
+
+```
+
+```{r GlobalValues, echo=FALSE, message=FALSE, warning=FALSE}
+
+### Patients 
+patient_samp=c('FR03|m36|Blood','FR04|m36|Blood','p1204|m24|Blood','FR01|m48|Blood','FR05|m30|Blood','p1202|m36|Blood')
+patient_name=c(expression(atop(WAS4,m36)),expression(atop(WAS5,m36)),expression(atop(beta*S/beta*S,m24)),
+               expression(atop(WAS2,m48)) ,expression(atop(WAS7,m30)),expression(atop(beta*0/beta*E,m36)))
+
+
+### Determine a general element theme for the different plots
+th=theme_bw()+
+   theme(text=element_text(family='Arial Bold',size=38, colour='black'),
+         panel.grid.major = element_blank(),panel.grid.minor = element_blank(),
+         strip.background=element_rect(fill=NA, color=NA),strip.text=element_text(family='Arial Bold',size=36,colour='black'),
+         axis.text=element_text(family='Arial Bold',size=28, colour='black'),
+         plot.title=element_text(family='Arial Bold',size=39, colour='black'))
+
+```
+
+
+\newpage
+
+###Figure 2A [Cutoff>0 & Initial]
+\vspace{0.1cm}
+
+```{r PrepF2A, echo=FALSE, message=FALSE, warning=FALSE}
+
+## Get the data
+plotData=intSites_new_concat_sup0[intSites_new_concat_sup0$key%in%patient_samp,]
+
+#Add the cellcount corrected.
+plotData$cellCount_corrected=rowSums(plotData[,grepl(names(plotData),pattern='_corrected$')])
+
+## formatting the plot
+
+#Name the patient.
+plotData$key=factor(plotData$key,levels=patient_samp)
+
+#Add the initial transplant source BM or MPB.
+plotData$source=ifelse(plotData$key%in%c('FR03|m36|Blood', 'FR04|m36|Blood', 'p1204|m24|Blood'),'BM','MPB')
+
+#Get the mean. 
+  DF=data.frame(key=rep(NA,6),mean=rep(NA,6))
+  DF$key=levels(plotData$key)
+  m=aggregate(plotData$cellCount,list(plotData$key),mean)
+  DF$mean=m$x
+  data=merge(plotData,DF)
+  
+```
+
+```{r F2A, echo=FALSE, message=FALSE, warning=FALSE, fig.height=6.5, fig.width=12, dev='png',dpi=350}
+
+## Plot
+#Initial Dataset
+  ggplot(data,aes(x=key,col=factor(source)))+geom_violin(aes(y=cellCount),size=0.8)+ 
+  geom_point(aes(y=mean),color='black',shape=18,size=4)+
+  facet_wrap(~factor(source),scales="free_x")+
+  labs(x='',y='IS abundance (log)')+
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+                labels = trans_format("log10", math_format(10^.x)),
+                limits=c(0.1,10^2.5))+
+  scale_x_discrete(breaks=levels(data$key),labels=patient_name)+
+  scale_color_manual(values= c('dodgerblue4','firebrick3'),name='')+th+ guides(colour = "none")
+
+```
+\newpage
+
+###Figure 2B [Cutoff>0] 
+\vspace{0.1cm}
+
+```{r PrepF2BC, echo=FALSE, message=FALSE, warning=FALSE}
+## Get the data
+data=intSites_new_concat_sup0
+data$cellCount=as.numeric(data$cellCount)
+data$Indicator=ifelse(data$cellCount>CUT,1,0)
+high=high_cell=c()
+
+for (i in 1:length(patient_samp)) {
+  x=patient_samp[i]
+  high[i]=nrow(dplyr::filter(data,key==x,Indicator ==1))
+  high_cell[i]=sum(dplyr::filter(data,key==x,Indicator ==1)$cellCount)/sum(dplyr::filter(data,key==x)$cellCount)
+  
+}
+
+dat=rbind(high,high_cell)
+dat=dplyr::mutate(data.frame(t(dat)),key=patient_samp)
+
+## formatting the data for the plot
+
+#Name the patient.
+dat$key=factor(dat$key,levels=patient_samp)
+
+#Add the initial transplant source BM or MPB.
+dat$source=factor(ifelse(dat$key%in%c('FR03|m36|Blood', 'FR04|m36|Blood', 'p1204|m24|Blood'),'BM','MPB'))
+
+```
+
+```{r F2B, echo=FALSE, message=FALSE, warning=FALSE, fig.height=7, fig.width=12, dev='png',dpi=350}
+## Plot 
+ggplot(dat,aes(x=key))+
+  geom_bar(aes(y=high,fill=source),stat="identity",size=1,alpha=0.8)+
+  facet_wrap(~source,scales="free_x")+
+  geom_text(aes(y=high,label=format(high,big.mark = " ", scientific = FALSE)),position = position_stack(vjust = 0.5),
+            size = 10,
+            color='white',fontface="bold")+
+  labs(fill = "",x='',y='Unique high abundance\nIS number')+
+  scale_x_discrete(breaks=dat$key,labels=patient_name)+
+  scale_fill_manual(values = c('dodgerblue4','firebrick3'))+ 
+  th+theme(legend.position="bottom")+
+  guides(fill='none')
+
+```
+
+###Figure 2C [Cutoff>0] 
+
+```{r F2C, echo=FALSE, message=FALSE, warning=FALSE, fig.height=7, fig.width=12, dev='png',dpi=350}
+
+ggplot(dat,aes(x=key))+
+  geom_bar(aes(y=high_cell,fill=source),stat="identity",size=1)+
+  facet_wrap(~source,scales="free_x")+
+  geom_text(aes(y=high_cell,label=round(high_cell,3)*100),position = position_stack(vjust = 0.5),
+            size = 10,
+            color='white',fontface="bold")+
+  labs(fill = "",x='',y='Proportion of total\ncell produced')+
+  scale_x_discrete(breaks=dat$key,labels=patient_name)+
+  scale_y_continuous(labels = percent_format())+
+  scale_fill_manual(values = c('gray50','gray'))+ 
+  th+theme(legend.position="bottom")+
+  guides(fill='none')
+
+```
+\newpage
+
+###Figure 3 [At least one of the tmpt has an abundance >`r I(CUT)`]
+\vspace{0.1cm}
+
+```{r PrepF3_testPart1, echo=FALSE, message=FALSE, warning=FALSE}
+
+## Get the data for two timepoints
+
+data=do.call(rbind, lapply(c("FR03 m12/m36","FR04 m12_6/m36","p1204 m12/m24","FR01 m22/m48" ,"FR05 m12/m30", "p1202 m11/m36" ), function(p){
+    
+  patient=unlist(str_split(p, '\\s+'))[1]
+  tmpt=unlist(str_split(unlist(str_split(p, '\\s+'))[2], '\\/'))
+  
+  p1=paste(patient,tmpt[1],'Blood',sep='|')        
+  p2=paste(patient,tmpt[2],'Blood',sep='|')      
+  
+  shared=s1Only=s2Only=c(NA,5)
+  variables = c("Neutrophils","Monocytes","Bcells","NKcells", "Tcells")
+  i=0
+  
+  for (v in variables)
+  {
+    i=i+1
+    vname=v
+    name=patient_name[i]
+    
+    f=intSites_new_concat_sup0[intSites_new_concat_sup0$key==p1 ,c('key','integrationSite',vname,"cellCount" )]
+    filter_criteria <- interp(~ v > 0, v= as.name(vname)) #Filter : have at least one of this celltype.
+    f=f %>% filter_(filter_criteria)
+    
+    s=intSites_new_concat_sup0[intSites_new_concat_sup0$key==p2 ,c('key','integrationSite',vname,"cellCount" )]
+    s=s %>% filter_(filter_criteria)
+    
+    #full join
+    j=merge(x=f,y=s,all=T,by='integrationSite')
+    
+    #cutoff : 
+    sites=filter(j,cellCount.x>CUT|cellCount.y>CUT) #Sites > CUT for at least one of the timepoint 
+    
+    x=sites[,c('integrationSite',names(sites[,grepl(pattern=".x$",names(sites))]))]
+    y=sites[,c('integrationSite',names(sites[,grepl(pattern=".y$",names(sites))]))]
+    names(x)=c('integrationSite',"key",vname,"cellcount")
+    names(y)=c('integrationSite',"key",vname,"cellcount")
+    
+    x=filter(x,is.na(key)==F)
+    y=filter(y,is.na(key)==F)
+    
+    shared[i] <- length(intersect(x$integrationSite,y$integrationSite)) 
+    s1Only [i]<- length(setdiff(x$integrationSite, y$integrationSite))   
+    s2Only [i]<- length(setdiff(y$integrationSite, x$integrationSite))   
+    name[i]=patient_name[i]
+    
+  }
+  
+  res=data.frame(rbind(shared,s1Only,s2Only))
+  res=t(res)
+  res=as.data.frame(res)
+  res$variables=variables
+  res$key=patient
+  res$tm=rep(paste(substr(tmpt[1],1,3),tmpt[2]),nrow(res))
+  res
+}))
+
+tab=data[,ncol(data):1]
+
+#Proportions.
+tab$s2prop=tab$s2Only/rowSums(tab[,c('s2Only','s1Only','shared')])
+tab$s1prop=tab$s1Only/rowSums(tab[,c('s2Only','s1Only','shared')])
+tab$shprop=tab$shared/rowSums(tab[,c('s2Only','s1Only','shared')])
+tab$tot=rowSums(tab[,c('s2Only','s1Only','shared')])
+
+names(tab) = c("tm","patient","cell_type","counts2","counts1","counts12","props2","props1","props12","totalIS")
+
+## formatting the data for the plot
+
+data=tab[,c("tm","patient","cell_type","props2","props1","props12")]
+names(data)=c("tm","key","variables",'s2Only','s1Only','shared')
+
+#Changing the format of the dataframe.
+plotData=melt(data,c('key','tm','variables'))
+
+#Correction of the values for the NKcells to remove from plot since no sample available for the first timepoint:
+plotData$value[plotData$key=='FR05'&plotData$variables=='NKcells']=0
+
+#Name & order the patients.
+name=c(expression(WAS4),
+       expression(WAS5),
+       expression(beta*S/beta*S),
+       expression(WAS2),
+       expression(WAS7),
+       expression(beta*0/beta*E))
+
+plotData$key=factor(plotData$key,levels=c('FR03','FR04','p1204','FR01','FR05','p1202'))
+
+#Order the celltypes.
+plotData$variables=factor(plotData$variables,levels=c("Neutrophils","Monocytes","Bcells","NKcells", "Tcells"),labels=c("G","M","B","K", "T"))
+
+#Order the variable share.
+plotData$share=factor(plotData$variable,levels=c('s1Only','s2Only','shared'),labels=c('first timepoint','second timepoint','shared'))
+
+#Add the initial transplant source BM or MPB.
+plotData$source=ifelse(plotData$key%in%c('FR03', 'FR04','p1204'),'BM','MPB')
+
+## Data for text labels
+text.a <- data.frame(key = plotData$key, 
+                     value = -Inf,
+                     text = plotData$tm)
+
+```
+
+```{r F3, echo=FALSE, message=FALSE, warning=FALSE, fig.height=13, fig.width=14, dev='png',dpi=350}
+## Plot
+p <-ggplot(plotData,aes(x=key, y=value))+
+  geom_bar(stat='identity',aes(fill=share))+
+  geom_text(data=text.a, aes(label = text),family='Arial Bold',size=8, vjust=4)+
+  facet_grid(plotData$variables~plotData$source,scales = "free_x")+
+  labs(fill='',x='',y='% of total IS for each celltype')+scale_y_continuous(labels = scales::percent)+
+  scale_fill_manual(values=c('deeppink3','turquoise3','slateblue4'))+
+  scale_x_discrete(labels=name,breaks=levels(plotData$key))+ 
+  th+theme(legend.position='bottom',axis.text.y=element_text(size=20))+
+ theme(strip.text.y = element_text(angle = 0))
+  
+## Turns clipping off to show the timepoints under the x-axis.
+gt <- ggplot_gtable(ggplot_build(p))
+gt$layout$clip = "off"
+grid.draw(gt)
+
+```
+
+\newpage
+
+###Test Figure 3 : GLM MIXED for each cell type [pvalues]
+\vspace{0.1cm}
+
+```{r PrepTest_Part2, echo=FALSE, message=FALSE, warning=FALSE}
+
+# /!\ ------- [Need to run the chunk "PrepF3_testPart1" previously] ------- /!\ #
+
+### Modelisation : GLM Mixed 
+
+## formatting the data for the test
+#Name & order the patients.
+tab$patients=factor(tab$patient,levels=c('FR03','FR04','p1204','FR01','FR05','p1202'),labels=c("WAS4","WAS5","betaS/betaS","WAS2","WAS7","beta0/betaE"))
+
+#Add the initial transplant source BM or MPB.
+tab=tab[order(tab$patients),]
+tab$engref=rep(c("BM","BM","BM","MPB","MPB","MPB"),each=5)
+
+cell_type=unique(tab$cell_type)
+pval=data.frame(Celltype=cell_type,pvalue=rep(NA,5))
+
+## Apply the mixed glm binomial model for each celltype:
+for (x in cell_type){
+  sharings = dplyr::filter(tab,cell_type ==  x) #Filter on the celltype
+  
+  #Filter on the counts to exclude was7 FOR NKcells (no tmpt1 analyzed) 
+  # /!\ [Not applicable if other patients have no biologically no counts1] /!\ #
+  sharings= dplyr::filter(sharings,counts1>0)  
+  
+  binom_glm_mixed = glmer(cbind(counts12,counts1+counts2)  ~ engref + (1|patients),family="binomial",data=sharings)
+  a=summary(binom_glm_mixed)
+  pval[pval$Celltype==x,2]=a$coefficients[2,4] #get the pvalues
+}
+
+## Print the pvalues 
+kable(pval)
+
+```
+
+
+
+
+
+
+###FIGURE 4A [Cutoff >`r I(CUT)` & Corrected]
+\vspace{0.1cm}
+
+```{r dis_Kullback,echo=FALSE, message=FALSE, warning=FALSE}
+
+### KULLBACK distance
+
+  kl = function(prop1, prop2){
+    sum(prop1 * log(prop1/prop2))
+  }
+
+## Get the values
+
+counts_multi_uni = matrix(nrow=6,ncol=3)
+i=0
+celltypes = c('G','M','B','K','T')
+
+
+for ( x in patient_samp){
+  i=i+1
+  
+  #Get the variables.
+  test=liste_kmeans_results[[x]]$intSites_withKmeans[c('key','cluster','cellCount',                                 
+          names(liste_kmeans_results[[x]]$intSites_withKmeans[,grep('_prop',names(liste_kmeans_results[[x]]$intSites_withKmeans))]))]
+  
+  #Order the columns.
+  test=test[,c(1:3,6,5,4,7,8)]  
+  
+  #Rename the prop corrected.
+  names(test)=c(names(test)[!grepl(x=names(test),'_prop')],'G','M','B','K','T') 
+  
+  #Initialisation.
+  compositions = list()     
+
+  initial_comp = crossOverReports[[x]]$cellCount[c(3,2,1,4,5)]
+  initial_comp = initial_comp/sum(initial_comp)
+  
+  nom = paste(celltypes,collapse = "")
+  compositions[[nom]] = initial_comp
+  
+  #Determine each reference composition (blood,GMBK,...,K,T).
+  for (m in 1:4){
+    aeffacer = combn(1:5,m)
+    
+    for (k in 1:ncol(aeffacer)){
+      comp = initial_comp
+      comp[aeffacer[,k]] = initial_comp[aeffacer[,k]]/1000
+      comp = comp / sum(comp)
+      nom = paste(celltypes[-aeffacer[,k]],collapse = "")
+      compositions[[nom]] = comp
+    }
+  }
+  
+  distances = matrix(ncol=nrow(test),nrow=length(compositions))
+  
+  #Apply the distance between the data and the references.
+  colnames(distances) = c(1:nrow(test))
+  for (j in 1:nrow(test)){
+    distances[,j] = unlist(lapply(compositions,kl,test[j,nchar(names(test))<2]))
+  }
+  
+  #Get the minimun distance for each site and the corresponding reference.
+  minimuns = names(compositions)[apply(distances,which.min,MARGIN = 2)]
+  
+  cells=test[,c('G','M','B','K','T','cellCount')]
+
+  k=rep(x,length(minimuns))
+  cluster=test$cluster
+  data=cbind(k,minimuns,cluster,cells)
+  assign(paste('dat',i,sep=''),data)
+  
+  #Get the minimum distance for each category (multi,oligo,uni).
+  card_uni = sum(nchar(minimuns)<2) 
+  tri_multi = c(apply(rbind(rep('G',3),combn(c('B','K','T'),2)),paste,collapse = "", MARGIN=2),
+  apply(rbind(rep('M',3),combn(c('B','K','T'),2)),paste,collapse = "", MARGIN=2))
+  card_multi = sum(nchar(minimuns)>3)  + sum(minimuns  %in%  tri_multi)
+  counts_multi_uni[i,] = c(card_uni,card_multi,nrow(test))
+}
+
+Kullback_dis=data.frame(rbind(dat1,dat2,dat3,dat4,dat5,dat6))
+
+## We count the number of letters of each "type" to determine the number of lineages found (1 to 5) [ex: BKT --> 3]
+  lin=nchar(Kullback_dis$minimuns)
+  Kullback_dis=dplyr::mutate(Kullback_dis,lin)
+
+## Add the initial transplant source BM or MPB
+  Kullback_dis$engref=ifelse(Kullback_dis$k%in%c('FR03|m36|Blood', 'FR04|m36|Blood', 'p1204|m24|Blood'),'BM','MPB')
+
+## Determine the "category" of each reference composition [ex: GMBKT --> multi]
+  multi = c(apply(rbind(rep('G',3),combn(c('B','K','T'),2)),paste,collapse = "", MARGIN=2),
+            apply(rbind(rep('M',3),combn(c('B','K','T'),2)),paste,collapse = "", MARGIN=2))
+  Kullback_dis$categ=ifelse((Kullback_dis$minimuns%in%multi | nchar(Kullback_dis$minimuns)>3 ),'multi',ifelse(nchar(Kullback_dis$minimuns)<2,'uni','oligo'))
+  Kullback_dis$categ=factor(Kullback_dis$categ,levels=c('multi','oligo','uni'))
+
+  #Order & name the patients.
+  Kullback_dis$k=factor(Kullback_dis$k,patient_samp,
+                        labels= c("WAS4~m36", "WAS5~m36","beta*S/beta*S~m24",
+                                  "WAS2~m48" ,"WAS7~m30","beta*0/beta*E~m36"))
+```
+
+
+```{r PrepF4A,echo=FALSE, message=FALSE, warning=FALSE}
+
+# /!\ ------- [Need to run the chunk "dis_Kullback" previously] ------- /!\ #
+
+## formatting the plot
+
+#Order the distances.
+  ord=unique(Kullback_dis$minimuns[order(Kullback_dis$categ,decreasing=T,nchar(Kullback_dis$minimuns)*-1)])
+  Kullback_dis$minimuns=factor(Kullback_dis$minimuns,levels=ord)
+
+#Number of IS.
+  nb_IS=aggregate(Kullback_dis$minimuns,list(Kullback_dis$k),length)
+  Kullback=merge(Kullback_dis,nb_IS,by.x=c('k'),by.y=c('Group.1'))
+  Kullback$labs=paste(Kullback$k,'~~~~(',Kullback$x,')', sep='')
+
+#Order the clusters.
+  ord=unique(Kullback$labs[order(Kullback$k)])
+  Kullback$labs=factor(Kullback$labs,levels=ord)
+
+```
+
+
+```{r F4A, echo=FALSE, message=FALSE, warning=FALSE, fig.height=19, fig.width=22, dev='png',dpi=350}
+
+## Define the limits for the categories of the sites (uni,oligo,multi)
+uni <- data.frame(xstart = 0, xend = 5.5)
+oligo <- data.frame(xstart = 5.5, xend = 19.5)
+multi <- data.frame(xstart = 19.5, xend = 31.5)
+
+## Plot
+  ggplot()+
+  geom_bar(data=Kullback,aes(x=minimuns,fill=as.factor(lin)),stat="count")+
+  geom_rect(data=uni,aes(linetype='uni',ymin=-Inf, ymax=Inf, xmin=xstart, xmax=xend),fill='black',alpha =0.29)+
+  geom_rect(data=oligo,aes(linetype='oligo',ymin=-Inf, ymax=Inf, xmin=xstart, xmax=xend),fill='gray', alpha =0.29)+
+  geom_rect(data=multi,aes(linetype='multi',ymin=-Inf, ymax=Inf, xmin=xstart, xmax=xend),fill='ivory', alpha =0.29)+
+  geom_bar(data=Kullback,aes(x=minimuns,fill=as.factor(lin)),stat="count")+
+  facet_wrap(engref~labs,labeller = label_parsed,scales='free_x')+
+  coord_flip()+theme_bw()+labs(x='',y='Unique IS Number')+
+  theme(text=element_text(family='Arial Bold',size=25),
+        axis.text.y=element_text(size=22.5,family='Arial Bold',colour='black'),
+        axis.text.x=element_text(size=24,family='Arial Bold',colour='black'),
+        legend.title=element_text(size=24),
+        legend.text=element_text(family='Arial Bold',size=22,colour='black'),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor=element_blank(),
+        strip.background=element_rect(fill=NA, color=NA),
+        strip.text=element_text(size=26))+
+  scale_linetype_manual(values = c("multi" = 1, "oligo" = 1, "uni" = 1), name = "Type",
+                        guide = guide_legend(override.aes = list(fill = c("ivory", "gray","black"),alpha = .29,colour='gray35',size=10)))+
+  guides(fill=guide_legend(title='Nb of\ncelltypes',override.aes = list(size=10.5)))
+
+```
+
+\newpage
+
+###Repartition of IS counts according to their HSC classes [Cutoff >`r I(CUT)` & Corrected]
+\vspace{0.1cm}
+
+```{r PrepF4B ,echo=FALSE, message=FALSE, warning=FALSE} 
+
+# /!\ ------- [Need to run the chunk "dis_Kullback" previously] ------- /!\ #
+
+## Get the data for the test
+counts_multi_uni=data.frame(counts_multi_uni)
+colnames(counts_multi_uni) = c('count_uni','count_multi','total_IS')
+counts_multi_uni$patient = patient_samp
+counts_multi_uni$engref=c(rep('BM',3),rep('MPB',3))
+counts_multi_uni$count_oligo=counts_multi_uni$total_IS-(counts_multi_uni$count_multi+counts_multi_uni$count_uni)
+
+show=counts_multi_uni[,c('patient','engref','count_uni',"count_oligo","count_multi","total_IS")]
+show$patient=c('WAS4[m36]','WAS5[m36]','betaS/betaS[m24]','WAS2[m48]','WAS7[m30]','beta0/betaE[m36]')
+names(show)=c('Patient','Source','Uni','Oligo','Multi','IS')
+
+#Print the values.
+kable(show)
+
+## formatting the data for the proportions plot
+counts_multi_uni$oligo=counts_multi_uni$count_oligo/counts_multi_uni$total_IS
+counts_multi_uni$uni=counts_multi_uni$count_uni/counts_multi_uni$total_IS
+counts_multi_uni$multi=counts_multi_uni$count_multi/counts_multi_uni$total_IS
+
+plotData=melt(counts_multi_uni[c('patient','engref','multi','oligo','uni')])
+
+```
+
+###Figure 4B [Cutoff >`r I(CUT)` & Corrected]
+\vspace{0.1cm}
+
+```{r F4B,echo=FALSE, message=FALSE, warning=FALSE,fig.height=8, fig.width=12, dev='png',dpi=350}
+
+## Plot of each category's proportions
+  ggplot()+geom_bar(data=plotData,aes(x=patient,y=value,fill=variable),stat='identity')+
+  facet_wrap(~engref,scales="free_x")+
+  labs(x='',y='Percentage of total IS',fill='')+
+  scale_x_discrete(breaks=plotData$patient,labels=patient_name)+ 
+  scale_y_continuous(labels=percent_format())+
+  scale_fill_manual(values=c('mediumorchid3','aquamarine2','royalblue1'),labels=c('multipotent **','oligopotent','unipotent *'))+
+  guides(fill=guide_legend(override.aes = list(size=10)))+
+  th+theme(legend.position='bottom')
+ 
+```
+
+###Test Figure 4 GLM Mixed : multi/oligo/uni [pvalues]
+\vspace{0.1cm}
+
+```{r test_multi,echo=FALSE, message=FALSE, warning=FALSE}
+
+#/!\ ------- [Need to run the chunk "dis_Kullback" & "prep5B" previously] ------- /!\ #
+
+### Modelisation : GLM Mixed
+pval=data.frame(category=c('multipotent','oligopotent','unipotent'),pvalue=rep(NA,3))
+counts_multi_uni$patient=factor(counts_multi_uni$patient)
+
+## Multi
+binom_glm_mixed_multi = glmer(cbind(count_multi,total_IS-count_multi)  ~ engref + (1|patient) , family="binomial", data=counts_multi_uni)
+a=summary(binom_glm_mixed_multi)
+pval[pval$category=='multipotent',2]=a$coefficients[2,4]
+
+## Oligo
+binom_glm_mixed_oligo = glmer(cbind(count_oligo,total_IS-count_oligo)  ~ engref + (1|patient) , family="binomial", data=counts_multi_uni)
+b=summary(binom_glm_mixed_oligo)
+pval[pval$category=='oligopotent',2]=b$coefficients[2,4]
+
+## Uni
+binom_glm_mixed_uni = glmer(cbind(count_uni,total_IS-count_uni)  ~ engref + (1|patient) , family="binomial", data=counts_multi_uni)
+b=summary(binom_glm_mixed_uni)
+pval[pval$category=='unipotent',2]=b$coefficients[2,4]
+
+## Print the pvalues :
+kable(pval)
+
+```
+
+\newpage
+
+###Figure 5A [Cutoff >`r I(CUT)` & Corrected]
+\vspace{0.1cm}
+```{r PrepF5A, echo=FALSE, message=FALSE, warning=FALSE }
+
+##Get the data
+data=do.call(rbind, lapply(patient_samp, function(s){
+  tableau = liste_kmeans_results[[s]]$tableau
+  tableau = tableau[,grepl("transf",names(tableau))==FALSE]
+  tableau$prop=tableau[,'abundance']/sum(tableau[,'abundance'])
+  tableau$R2=paste(round(liste_kmeans_results[[s]]$R2,2)) 
+  tableau
+}))
+
+
+data$key=factor(data$key,levels=patient_samp, labels=c("WAS4[m36]", "WAS5[m36]","beta*S/beta*S[m24]","WAS2[m48]" ,"WAS7[m30]","beta*0/beta*E[m36]"))
+
+
+#Add the initial transplant source BM or MPB.
+data$source=ifelse(data$key%in%c("WAS4[m36]", "WAS5[m36]","beta*S/beta*S[m24]"),'BM','MPB')
+
+
+  data$cluster=factor(data$cluster,levels=c('GMBKT','GMBT','GMBK','GMK','GMB','GBT','GBK',
+                                            'MBK','MK','MB', 'GM','GK', 'GB', 'BT','BK','G','M','B','K','T'))
+
+
+colors <- c(GMBKT='mediumorchid4',GMBT='blueviolet',GMBK='mediumpurple4',
+              GMK='deepskyblue3',GB='green3',GM='deepskyblue4',BT='darkorange2',
+              T='red3',B='lightgoldenrod',K='turquoise2',G='royalblue4',M='gray22','[Blood]'='black')
+
+
+```
+
+```{r F5A, echo=FALSE, message=FALSE, warning=FALSE, fig.height=8, fig.width=13, dev='png',dpi=350}
+
+## Plot
+ ggplot(data)+geom_bar(aes(x=key, y=prop, fill=cluster,group=prop),stat='identity',color='white')+
+ scale_fill_manual(values=colors)+
+ scale_y_continuous(labels = percent_format())+
+ facet_wrap(~source,scales='free_x',labeller = label_parsed)+
+ scale_x_discrete(breaks=levels(data$key),labels=patient_name)+
+ labs(x='', y='Subsets proportion') +
+ th+
+ guides(fill=guide_legend(title='',override.aes = list(size=10)))
+
+```
+
+###Figure 5B [Cutoff >`r I(CUT)` & Corrected]
+\vspace{0.1cm}
+
+```{r PrepF5B, echo=FALSE, message=FALSE, warning=FALSE }
+
+## Get the data
+data=do.call(rbind, lapply(patient_samp, function(x){
+  
+  a=liste_kmeans_results[[x]]$intSites_withKmeans[c('key','cluster','cellCount',
+      names(liste_kmeans_results[[x]]$intSites_withKmeans[,grep('_prop',names(liste_kmeans_results[[x]]$intSites_withKmeans))]))]
+
+  #Rename the celltypes corrected proportions.
+  names(a)=c(names(a)[!grepl(x=names(a),'_prop')],'B','M','G','K','T')
+
+  #Get the blood proportions "cellCount" and insert the values in the dataframe.
+  l=list(unique(a$key),'[Blood]',200,
+         crossOverReports[[x]]$cellCount[1],crossOverReports[[x]]$cellCount[2],
+         crossOverReports[[x]]$cellCount[3],crossOverReports[[x]]$cellCount[4],
+         crossOverReports[[x]]$cellCount[5])
+  a=rbind(a,rep(NA,ncol(a)))
+  a[nrow(a),]=l
+  a
+  }))
+
+  data$cluster=as.factor(data$cluster)
+  
+  #Add the initial transplant source BM or MPB
+  data$source=ifelse(data$key%in%c('FR03|m36|Blood', 'FR04|m36|Blood', 'p1204|m24|Blood'),'BM','MPB')
+  
+  data$key=factor(data$key,levels=patient_samp,
+                      labels=c("WAS4[m36]", "WAS5[m36]","beta*S/beta*S[m24]","WAS2[m48]" ,"WAS7[m30]","beta*0/beta*E[m36]"))
+
+  ## formatting the data for the plot
+
+  #Fix the colors, format and size according the clusters.
+  
+colors <- c(GMBKT='mediumorchid4',GMBT='blueviolet',GMBK='mediumpurple4',
+              GMK='deepskyblue3',GB='green3',GM='deepskyblue4',BT='darkorange2',
+              T='red3',B='lightgoldenrod',K='turquoise2',G='royalblue4',M='gray22','[Blood]'='black')
+
+shape <- c(GMBKT=19,GMBT=19,GMBK=19,
+              GMK=19,GB=19,GM=19,BT=19,
+              T=19,B=19,K=19,G=19,M=19,'[Blood]'=18)
+
+size <- c(GMBKT=5,GMBT=5,GMBK=5,
+              GMK=5,GB=5,GM=5,BT=5,
+              T=5,B=5,K=5,G=5,M=5,'[Blood]'=6)
+
+  #Order the clusters.
+  #[Blood] correspond to the patient's blood proportions of each cell type.
+  data$cluster=factor(data$cluster,levels=c('GMBKT','GMBT','GMBK','GMK','GMB','GBT','GBK',
+                                            'MBK','MK','MB', 'GM','GK', 'GB', 'BT','BK','G','M','B','K','T','[Blood]'))
+
+
+```
+
+
+```{r F5B, echo=FALSE, message=FALSE, warning=FALSE, fig.height=13, fig.width=20, dev='png',dpi=350}
+## Plot 
+#Configuration : G+M,T,B+K
+    ggtern(data, aes(G+M, T, B+K, group=cluster)) +
+    
+    ggplot(data, aes(G+M, T, B+K, group=cluster)) + coord_tern()
+    geom_point(aes(color= cluster,alpha=cellCount,shape=cluster,size=cluster))+
+    tern_limit(1.1,1.1,1.1) +xlab('GM')+ylab('T')+zlab('BK')+
+    facet_wrap(source~key,labeller = label_parsed)+
+    scale_shape_manual(values=shape)+
+    scale_size_manual(values=size)+ theme(legend.text = element_text(size = 21))+
+    scale_color_manual(values = colors)+scale_alpha_continuous(guide='none')+theme_showarrows()+
+    theme(legend.text = element_text(size = 26),text=element_text(family='Arial Bold',size=26),
+          strip.background=element_rect(fill=NA, color=NA),strip.text=element_text(size=32),axis.text=element_text(size=20,family='Arial Bold',colour='black'))+
+    guides(colour=guide_legend(title='',override.aes = list(size=8),ncol=1),shape=guide_legend(title='',override.aes = list(size=7),ncol=1),size='none')
+        
+```
+
+\newpage
+
+\vspace*{\stretch{1}}
+\begin{center}
+Supplemental Figures
+\end{center}
+\vspace*{\stretch{1}}
+
+\newpage
+
+
+###Figure Sup 3A : IS Dataset [Cutoff>`r I(CUT)`]
+\vspace{0.1cm}
+
+
+```{r PrepFsup3A, echo=FALSE, message=FALSE, warning=FALSE}
+
+## Get the data : Initial proportions 
+cellTypes <- c('Bcells', 'Monocytes', 'Neutrophils', 'NKcells', 'Tcells')
+
+data=get(paste0('intSites_new_concat_sup',CUT))
+data=data[data$key%in%patient_samp,]
+cell=aggregate(data[,cellTypes],list(data$key),sum)
+cell[,cellTypes]=cell[,cellTypes]/rowSums(cell[,cellTypes])
+
+## formatting the plot
+
+DF=melt(cell, id.var="Group.1")
+
+#Add the initial transplant source BM or MPB.
+DF$source=ifelse(DF$Group.1%in%c('FR03|m36|Blood', 'FR04|m36|Blood', 'p1204|m24|Blood'),'BM','MPB')
+
+#Order the celltypes for the plot.
+DF$variable=factor(DF$variable,levels=c("Neutrophils","Monocytes","Bcells","NKcells", "Tcells" ) ,labels=c('G','M','B','K','T'))
+
+#Name & order the patients.
+DF$Group.1=factor(DF$Group.1,levels=patient_samp)
+
+```
+
+
+```{r Fsup3A, echo=FALSE, message=FALSE, warning=FALSE, fig.height=6.5, fig.width=12, dev='png',dpi=350}
+
+## Plot
+  ggplot(DF, aes(x=Group.1, y=value, fill=variable))+
+  geom_bar(stat='identity')+
+  facet_wrap(~source,scales="free_x")+
+  labs(x='', y='IS dataset \n Cell types proportion')+
+  scale_fill_manual(values=c('royalblue1','gray48','lightgoldenrod','mediumturquoise','indianred1'))+
+  scale_y_continuous(labels = percent_format())+
+  scale_x_discrete(breaks=levels(DF$Group.1),labels=patient_name)+
+  th+guides(fill=guide_legend(title='',override.aes = list(size=10))) 
+  
+```
+
+###Figure Sup 3B : Initial blood sample
+\vspace{0.1cm}
+
+```{r PrepFsup3B, echo=FALSE, message=FALSE, warning=FALSE}
+
+## Get the data
+cellTypes <- toupper(c('Bcells', 'Monocytes', 'Neutrophils', 'NKcells', 'Tcells'))
+
+plotData=do.call(rbind, lapply(patient_samp, function(x){
+  patient <- unlist(str_split(x, '\\|'))[1]
+  timePoint <- unlist(str_split(x, '\\|'))[2]
+  source <- unlist(str_split(x, '\\|'))[3]
+  
+  counts <- crossOverReports[[x]]$cellCount
+  names(counts) <- cellTypes
+  counts <- as.data.frame(t(counts))
+  row.names(counts) <- 'Blood cell counts'
+  
+  plotData   <- melt(as.matrix(counts))
+  plotData$f <- paste(patient, timePoint,source,sep='|')
+  plotData
+}))
+
+## formatting the data
+
+#Add the source BM or MPB.
+plotData$engref=ifelse(plotData$f%in%c('FR03|m36|Blood', 'FR04|m36|Blood', 'p1204|m24|Blood'),'BM','MPB')
+
+#Order the celltypes for the plot.
+plotData$var_name=factor(plotData$Var2,levels=toupper(c("Neutrophils","Monocytes","Bcells","NKcells", "Tcells" )),labels=c('G','M','B','K','T'))
+
+#Order the patients.
+plotData$f=factor(plotData$f,levels=patient_samp)
+
+```
+
+
+```{r Fsup3B, echo=FALSE, message=FALSE, warning=FALSE, fig.height=6.5, fig.width=12, dev='png',dpi=350}
+
+## Plot
+  ggplot(plotData, aes(x=f, y=value, fill=var_name))+
+  geom_bar(stat='identity')+facet_wrap(~engref,scales="free_x")+
+  labs(x='', y='Initial Blood Sample \n Cell types proportion')+
+  scale_fill_manual(values=c('royalblue1', 'gray48', 'lightgoldenrod', 'mediumturquoise', 'indianred1')) +
+  scale_y_continuous(labels = percent_format())+   
+  scale_x_discrete(breaks=levels(plotData$f),labels=patient_name)+th+
+  guides(fill=guide_legend(title='',override.aes = list(size=10))) 
+
+```
+\newpage
+
+###Figure Sup 3C : VCN 
+\vspace{0.1cm}
+
+```{r PrepFsup3C, echo=FALSE, message=FALSE, warning=FALSE}
+
+## Get the data (VCN)
+cellTypes <- toupper(c('Bcells', 'Monocytes', 'Neutrophils', 'NKcells', 'Tcells'))
+
+plotData=do.call(rbind, lapply(patient_samp, function(x){
+  patient <- unlist(str_split(x, '\\|'))[1]
+  timePoint <- unlist(str_split(x, '\\|'))[2]
+  source <- unlist(str_split(x, '\\|'))[3]
+  
+  freq <- crossOverReports[[x]]$VCN/sum(crossOverReports[[x]]$VCN)
+  names(freq) <- cellTypes
+  freq <- as.data.frame(t(freq))
+  row.names(freq) <- 'VCN'
+  
+  plotData   <- melt(as.matrix(freq))
+  plotData$f <- paste(patient, timePoint,source,sep='|')
+  plotData
+}))
+
+## formatting the data
+
+#Add the initial transplant source BM or MPB.
+plotData$engref=ifelse(plotData$f%in%c('FR03|m36|Blood', 'FR04|m36|Blood', 'p1204|m24|Blood'),'BM','MPB')
+
+#Order the celltypes for the plot.
+plotData$var_name=factor(plotData$Var2,levels=toupper(c("Neutrophils","Monocytes","Bcells","NKcells", "Tcells" )),labels=c('G','M','B','K','T'))
+
+#Order the patients.
+plotData$f=factor(plotData$f,levels=patient_samp)
+
+```
+
+
+```{r Fsup3C, echo=FALSE, message=FALSE, warning=FALSE, fig.height=6.5, fig.width=12, dev='png',dpi=350}
+
+## Plot
+  ggplot(plotData, aes(x=f, y=value, fill=var_name))+
+  geom_bar(stat='identity')+
+  facet_wrap(~engref,scales="free_x")+
+  labs(x='', y='Vector Copy Number \n Cell types proportion')+
+  scale_fill_manual(values=c('royalblue1', 'gray48', 'lightgoldenrod', 'mediumturquoise', 'indianred1')) +
+  scale_y_continuous(labels = percent_format())+   
+  scale_x_discrete(breaks=levels(plotData$f),labels=patient_name)+th+
+  guides(fill=guide_legend(title='',override.aes = list(size=10))) 
+
+```
+
+###Figure Sup 3D : Post-sort
+\vspace{0.1cm}
+
+```{r PrepFsup3D, echo=FALSE, message=FALSE, warning=FALSE}
+
+## Get the data
+celltypes <- toupper(c('Bcells', 'Monocytes', 'Neutrophils', 'NKcells', 'Tcells'))
+
+plotData=do.call(rbind, lapply(patient_samp, function(x){
+  patient <- unlist(str_split(x, '\\|'))[1]
+  timePoint <- unlist(str_split(x, '\\|'))[2]
+  source <- unlist(str_split(x, '\\|'))[3]
+  
+  counts <- crossOverReports[[x]]$psort
+  names(counts) <- celltypes
+  counts <- as.data.frame(t(counts))
+  row.names(counts) <- 'Psort'
+  
+  plotData   <- melt(as.matrix(counts))
+  plotData$f <- paste(patient,timePoint,source,sep='|')
+  plotData
+}))
+
+## formatting the data
+
+#Add the initial transplant source BM or MPB.
+plotData$engref=ifelse(plotData$f%in%c('FR03|m36|Blood', 'FR04|m36|Blood', 'p1204|m24|Blood'),'BM','MPB')
+
+#Order the celltypes for the plot.
+plotData$var_name=factor(plotData$Var2,levels=toupper(c("Neutrophils","Monocytes","Bcells","NKcells", "Tcells" )),labels=c('G','M','B','K','T'))
+
+#Order the patients.
+plotData$f=factor(plotData$f,levels=patient_samp)
+```
+
+
+```{r Fsup3D, echo=FALSE, message=FALSE, warning=FALSE, fig.height=6.5, fig.width=12, dev='png',dpi=350}
+
+## Plot
+  ggplot(plotData, aes(x=f, y=value, fill=var_name)) +
+  geom_bar(stat='identity')+
+  facet_wrap(~engref,scales="free_x")+
+  labs(x='', y='Post-sort \n Cell types proportion')+
+  scale_y_continuous(labels = percent_format())+   
+  scale_x_discrete(breaks=levels(plotData$f),labels=patient_name)+
+  scale_fill_manual(values=c('royalblue1','gray48','lightgoldenrod','mediumturquoise','indianred1'))+
+  th+guides(fill=guide_legend(title='',override.aes = list(size=10)))
+  
+
+```
+
+###Figure Sup 4 [Cutoff>0 & Initial]
+\vspace{0.1cm}
+
+```{r PrepFsup4, echo=FALSE, message=FALSE, warning=FALSE}
+
+## Get the data : abundance of the dataset without cutoff.
+data=intSites_new_concat_sup0[intSites_new_concat_sup0$key%in%patient_samp,]
+
+#Name & order the patients.
+data$key=factor(data$key,levels=patient_samp,
+                         labels=c("WAS4[m36]", "WAS5[m36]","beta*S/beta*S[m24]",
+                                  "WAS2[m48]" ,"WAS7[m30]","beta*0/beta*E[m36]"))
+
+#Add the initial transplant source BM or MPB.
+data$source=ifelse(data$key%in%c("WAS4[m36]", "WAS5[m36]","beta*S/beta*S[m24]"),'BM','MPB')
+
+```
+
+```{r Fsup4, echo=FALSE, message=FALSE, warning=FALSE, fig.height=10, fig.width=16, dev='png',dpi=350}
+## Plot
+  ggplot(data=data,aes(x=cellCount,color=source,fill=source))+geom_bar()+
+  facet_wrap(~source+key,labeller = label_parsed,scales='free')+
+  coord_flip()+labs(y='Number of IS',x='IS abundance')+
+  scale_fill_manual(values=c('dodgerblue4','firebrick3'),name='')+
+  scale_colour_manual(values=c('dodgerblue4','firebrick3'),name='')+
+  th+theme(axis.text.y=element_text(size=25),axis.text.x = element_text(angle = 30,hjust=1,size=22))+
+  guides(fill='none',colour='none')
+```
+
+\newpage
+
+###Figure Sup5A [Cutoff>`r I(CUT)`, tmpt2]
+\vspace{0.1cm}
+
+```{r PrepFsup5A,echo=FALSE, message=FALSE, warning=FALSE}
+
+## Get the data for each patient
+
+test=matrix(NA,ncol=6,nrow=15)
+colnames(test)=patient_samp
+
+nb=matrix(NA,ncol=6,nrow=1)
+colnames(nb)=patient_samp
+
+for (x in patient_samp){
+  test[,x]=liste_kmeans_results[[x]]$elbow
+  nb[,x]=liste_kmeans_results[[x]]$nbclust_estim
+  }
+
+#Change the format of the dataframes.  
+plotData=melt(test)
+nb=melt(nb)
+
+#Name and order the patients.
+plotData$Var2=factor(plotData$Var2,levels=patient_samp,
+                                   labels=c("WAS4[m36]", "WAS5[m36]","beta*S/beta*S[m24]",
+                                             "WAS2[m48]" ,"WAS7[m30]","beta*0/beta*E[m36]"))
+
+nb$Var2=factor( nb$Var2,levels=patient_samp,
+                        labels=c("WAS4[m36]", "WAS5[m36]","beta*S/beta*S[m24]",
+                                  "WAS2[m48]" ,"WAS7[m30]","beta*0/beta*E[m36]"))
+```
+```{r Fsup5A,echo=FALSE, message=FALSE, warning=FALSE,fig.height=8, fig.width=16, dev='png',dpi=350 }
+
+## Plot
+  ggplot(plotData,aes(x=Var1,y=value,col=Var2))+ 
+  geom_line()+ geom_point()+
+  geom_vline(data=nb,aes(xintercept=value),linetype=2,color="gray55",show.legend = T)+
+  facet_wrap(~Var2,labeller = label_parsed,scales='free_x')+
+  scale_x_continuous(breaks=1:15)+
+  labs(y="R2", x="Number of clusters K")+   
+  theme_bw()+guides(color=FALSE)+ 
+  theme(text=element_text(family='Arial Bold',size=38, colour='black'),panel.grid.major.y = element_blank(),
+        panel.grid.minor=element_blank(),strip.background=element_rect(fill=NA, color=NA),
+        strip.text=element_text(size=36),axis.text =element_text(family='Arial Bold',size=20, colour='black'))
+
+```
+
+###Figure Sup5B [Cutoff >`r I(CUT)` & Corrected]
+\vspace{0.1cm}
+```{r PrepFsupB, echo=FALSE, message=FALSE, warning=FALSE }
+
+##Get the data
+data=do.call(rbind, lapply(patient_samp, function(s){
+  tableau = liste_kmeans_results[[s]]$tableau
+  tableau = tableau[,grepl("transf",names(tableau))==FALSE]
+  tableau$prop=round(tableau[,'abundance']/sum(tableau[,'abundance']),2)*100
+  tableau$R2=paste(round(liste_kmeans_results[[s]]$R2,2)) 
+  tableau
+}))
+
+plotData = gather(data,var_name,var_value,names(data[grepl('_prop',names(data))]))
+
+#Name & order the patient.
+plotData$key=factor(plotData$key,levels=patient_samp,
+                    labels=c("WAS4[m36]", "WAS5[m36]","beta*S/beta*S[m24]","WAS2[m48]" ,"WAS7[m30]","beta*0/beta*E[m36]"))
+
+
+#Order the celltypes for the plot.
+plotData$var_name=factor(plotData$var_name,levels=c("Neutrophils_prop","Monocytes_prop","Bcells_prop",
+                                                    "NKcells_prop", "Tcells_prop" ),labels=c('G','M','B','K','T'))
+
+#Order the clusters for the plot.
+plotData$x=paste(plotData$cluster,paste0(plotData$prop,'%'),sep='\n')
+ordo=unique(plotData$x[order(plotData$prop,decreasing = TRUE)])
+plotData$x=factor(plotData$x,levels=ordo)
+
+
+#format the R2 values.
+plotData$R=paste0(plotData$key,'~~~~','italic(phantom(0)[R^2~',plotData$R2,'])')
+plotData$R=factor(plotData$R,levels=unique(plotData$R))
+
+#Add the initial transplant source BM or MPB.
+plotData$source=ifelse(plotData$key%in%c("WAS4[m36]", "WAS5[m36]","beta*S/beta*S[m24]"),'BM','MPB')
+
+```
+
+```{r Fsup5B, echo=FALSE, message=FALSE, warning=FALSE, fig.height=17, fig.width=22, dev='png',dpi=350}
+gt= ggplotGrob(ggplot(plotData, aes(x=x, y=var_value, fill=var_name)) + facet_wrap(source~R,scales='free',labeller = label_parsed)+
+                 geom_bar(stat='identity') +
+                 scale_fill_manual(values=c('royalblue1', 'gray48', 'lightgoldenrod', 'mediumturquoise', 'indianred1'))+
+                 scale_y_continuous(labels = percent_format())+
+                 labs(x='', y='Cell types proportion') +
+                 guides(fill=guide_legend(title='')) +th+
+                 theme(axis.text.x=element_text(size=30,angle=90,vjust=0.5),legend.position='bottom')+
+                 guides(fill=guide_legend(title='',override.aes = list(size=10))))
+
+
+#Access the x-axis labels to check the patient
+#gt$grobs[[19]]$children[[2]]$grobs[[2]]$children[[1]]$label
+
+#WAS2
+gt$grobs[[14]]$children[[2]]$grobs[[2]]$children[[1]]$gp$col=c('red3','deepskyblue3','lightgoldenrod','gray22','royalblue4','turquoise2')
+#WAS7
+gt$grobs[[15]]$children[[2]]$grobs[[2]]$children[[1]]$gp$col=c('red3','lightgoldenrod','turquoise2','royalblue4')
+#Beta0
+gt$grobs[[16]]$children[[2]]$grobs[[2]]$children[[1]]$gp$col=c('green3','mediumpurple4','red3','royalblue4','deepskyblue3','lightgoldenrod','turquoise2')
+#Was4
+gt$grobs[[17]]$children[[2]]$grobs[[2]]$children[[1]]$gp$col=c('mediumorchid4','deepskyblue3','red3','royalblue4','green3')
+#Was5
+gt$grobs[[18]]$children[[2]]$grobs[[2]]$children[[1]]$gp$col=c('mediumorchid4','red3','deepskyblue3','royalblue4','turquoise2')
+#BetaS
+gt$grobs[[19]]$children[[2]]$grobs[[2]]$children[[1]]$gp$col=c('mediumorchid4','mediumorchid4','darkorange2','green3','lightgoldenrod','deepskyblue3','turquoise2')
+
+grid::grid.draw(gt)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+### Clonal size statistical Tests Sup
+### Need to set ALL_TEST= TRUE
+\vspace{0.1cm}
+
+```{r SuppTEST,echo=FALSE, message=FALSE, warning=FALSE, fig.height=10, fig.width=13, dev='png',dpi=350}
+
+######################################
+############ Clonal size tests ############# 
+######################################
+
+if (ALL_TEST==TRUE){
+  
+  library(bbmle)
+  library(glmmADMB)
+  
+effect_transplant_func = function(dat,famille,cutoff){
+
+  #formatting the data
+  datamerged=dat[dat$key%in%patient_samp,c('key','cellCount')]
+  datamerged$transplant=ifelse(datamerged$key%in%c('FR03|m36|Blood','FR04|m36|Blood','p1204|m24|Blood'),'BM','MPB')
+  
+  names(datamerged)=c('patient','abundance','transplant')
+  
+  #define the cut to remove (abundance minimum)
+  cut = min(datamerged$abundance)
+  
+  #use the cut to put at 0
+  abund_minus_cut = datamerged$abundance-cut
+  datamerged = mutate(datamerged, abundance_minus_cut = abund_minus_cut)
+  
+  #### Models
+  type_data='initial'
+  
+  datamerged$transplant=factor(datamerged$transplant)
+  datamerged$patient=factor(datamerged$patient,levels=patient_samp,
+                                                labels=c("WAS4[m36]", "WAS5[m36]","beta*S/beta*S[m24]",
+                                                         "WAS2[m48]" ,"WAS7[m30]","beta*0/beta*E[m36]"))
+  
+  
+  print("*********** Effect of the graft and the patients on the abundance ***********")
+  
+  ## Not mixed : Graft
+  
+  #Fit not mixed, not ZIP (basic) : graft
+  type=data.frame(Data=type_data ,Variable='transplant',sup=cutoff,Mixed=F,ZIP=F)
+  print(kable(type, align='c',padding=2))
+  fit_basic <- glmmadmb(abundance_minus_cut  ~ transplant, data=datamerged, zeroInflation=FALSE,family=famille,extra.args="-ndi 10000")
+  print(summary(fit_basic))
+ 
+  #Fit not mixed, ZIP : graft
+  type=data.frame(Data=type_data,Variable='transplant',sup=cutoff,Mixed=F,ZIP=T)
+  print(kable(type))
+  fit_zip <- glmmadmb(abundance_minus_cut  ~ transplant, data=datamerged, zeroInflation=TRUE,family=famille,extra.args="-ndi 10000")
+  print(summary(fit_zip))
+  
+  ## Not mixed : Patient
+
+  #Fit not mixed, not ZIP (basic) : patient (ref=WAS4 m36)
+  type=data.frame(Data=type_data,Variable='patient',sup=cutoff,Mixed=F,ZIP=F)
+  print(kable(type))
+  fit_basic_P <- glmmadmb(abundance_minus_cut  ~ patient, data=datamerged, zeroInflation=FALSE,family=famille,extra.args="-ndi 10000")
+  print(summary(fit_basic_P))
+
+  #Fit not mixed, ZIP : patient (ref=WAS4 m36)
+  type=data.frame(Data=type_data,Variable='patient',sup=cutoff,Mixed=F,ZIP=T)
+  print(kable(type))
+  fit_zip_P <- glmmadmb(abundance_minus_cut  ~ patient, data=datamerged, zeroInflation=TRUE,family=famille,extra.args="-ndi 10000")
+  print(summary(fit_zip_P))
+
+  
+  ## Mixed : Graft
+
+  #Fit mixed, not ZIP
+  type=data.frame(Data=type_data,Variable='transplant',sup=cutoff,Mixed=T,ZIP=F)
+  print(kable(type))
+  fit_mix <- glmmadmb(abundance_minus_cut  ~ transplant+ (1|patient), data=datamerged, zeroInflation=FALSE,family=famille,extra.args="-ndi 100000")
+  print(summary(fit_mix))
+
+  #Fit mixed, ZIP
+  type=data.frame(Data=type_data,Variable='transplant',sup=cutoff,Mixed=T,ZIP=T)
+  print(kable(type))
+  fit_zipmixed <- glmmadmb(abundance_minus_cut  ~ transplant + (1|patient) , data=datamerged, zeroInflation=TRUE,family=famille,extra.args="-ndi 100000")
+  print(summary(fit_zipmixed))
+
+  ### Deltas of the AICs
+  print('Differences of AICs')
+  print(AICtab(fit_basic,fit_zip,fit_basic_P,fit_zip_P,fit_mix,fit_zipmixed))
+
+}
+
+#sup 0 Initial(fam='nbinom')
+effect_transplant_func(dat=intSites_new_concat_sup0[,],famille='nbinom',cutoff=0)
+
+} else {print("Option ALL_TEST = FALSE : not running the abundance test.")}
+```
+

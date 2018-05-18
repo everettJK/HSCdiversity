@@ -1,0 +1,6 @@
+prePushCommands
+lib/Everett.RData
+data/correctedSeqRuns
+prep/freezes
+data/tmp
+lib/figures

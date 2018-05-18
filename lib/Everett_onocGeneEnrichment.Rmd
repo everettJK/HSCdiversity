@@ -1,0 +1,222 @@
+---
+fontsize: 12pt
+geometry: margin=0.25in
+header-includes:
+    - \usepackage{caption}
+title: 'WAS cell lineage study - supplemental 1'
+author: 'John K. Everett'
+output:
+  pdf_document:
+    keep_tex: yes
+    latex_engine: xelatex
+---
+  
+```{r, echo=FALSE, eval=FALSE}
+library(tidyverse)
+options(stringsAsFactors = FALSE)
+
+# Read in intSite data. The intSite positions and abundances are the result of processing the output 
+# of the INSPIIRED intSite pipeline with C Berry's dRep software package.
+intSites <- read.csv(gzfile('../data/intSites.csv.gz'), header = TRUE)
+for(i in c('start', 'end', 'width', 'estAbund')) intSites[[i]] <- as.numeric(intSites[[i]]) 
+intSites[which(is.na(intSites$nearestFeature)),]$nearestFeature <- 'NONE'
+
+
+# Read in the list of samples that are to be exported to the SRA.
+SRA_samples <- read.table('../data/SRA_samples.txt', sep = ';', header = TRUE)
+
+# For plot clarity, change all m12_6 time points to m12. This only pertains to paient FR04.
+intSites$timepoint <- as.character(intSites$timepoint)
+intSites[which(intSites$timepoint == 'm12_6'),]$timepoint <- 'm12'
+
+# Restrict data set to SRA samples.
+all(SRA_samples$SpecimenAccNum %in% intSites$sampleName)
+intSites <- subset(intSites, sampleName %in% SRA_samples$SpecimenAccNum)
+
+# Convert the timepoint character string to a numeric days column.
+intSites$timePointDays <- toupper(intSites$timepoint)
+intSites$timePointDays <- gsub('_', '.', intSites$timePointDays)
+intSites$timePointDays <- sapply(intSites$timePointDays, function(x){
+  if(grepl('D', x)){
+    return(as.numeric(stringr::str_match(x, '[\\d\\.]+')))
+  } else if(grepl('M', x)){
+    return(as.numeric(stringr::str_match(x, '[\\d\\.]+'))*30.4167)
+  } else if(grepl('Y', x)){
+    return(as.numeric(stringr::str_match(x, '[\\d\\.]+'))*365)
+  } else {
+    message('Warning - could not determine date unit for: ', x)
+    return(as.numeric(stringr::str_match(x, '[\\d\\.]+')))
+  }
+})
+
+# Rename cell types.
+intSites$celltype <- as.character(intSites$celltype)
+intSites$celltype <- gsub('NEUTROPHILS', 'GRANULOCYTES', intSites$celltype)  
+
+# Change the patient identifiers.
+convertName <- function(x){
+  nameConversion <- data.frame(internal=c('FR01', 'FR03', 'FR04', 'FR05', 'LT',    'p1204', 'TST', 'p1202', 'All'), 
+                               external=c('WAS2', 'WAS4', 'WAS5', 'WAS7', 'bS/bS', 'bS/bS', 'b0/bE', 'b0/bE', 'All')) 
+  
+  nameConversion[match(tolower(x), tolower(nameConversion$internal)),]$external
+}
+
+intSites$patient <- convertName(intSites$patient)
+
+# Consider patient position ids since the same position may occasionally be found between subjects.
+intSites$patientPosid <- paste(intSites$patient, intSites$posid)
+
+d <- data.frame(intSites)
+save.image(file = 'Everett_oncoGeneEnrichment_1.RData')
+```
+
+```{r, echo=FALSE, message=FALSE, warnings=FALSE, error=FALSE}
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(gt23)
+options(stringsAsFactors = FALSE)
+load('Everett_oncoGeneEnrichment_1.RData')
+
+ppNum   <- function(n) format(n, big.mark = ",", scientific = FALSE, trim = TRUE)
+percent <- function(x, digits = 2, format = "f", ...) paste0(formatC(100 * x, format = format, digits = digits, ...), "%")
+  
+testOncoGenes <- function(distCol){
+  o <- list()
+  o[['m']] <- matrix(c(n_distinct(d[d$timePointDays <   690 & abs(d[,distCol]) >   50000,]$patientPosid),
+                       n_distinct(d[d$timePointDays <   690 & abs(d[,distCol]) <=  50000,]$patientPosid),
+                       n_distinct(d[d$timePointDays >=  690 & abs(d[,distCol]) >   50000,]$patientPosid),
+                       n_distinct(d[d$timePointDays >=  690 & abs(d[,distCol]) <=  50000,]$patientPosid)), 
+                       byrow = TRUE, nrow=2)  
+
+  o[['f']] <- fisher.test(o[['m']])
+  dimnames(o[['m']]) <- list(c('First time point', 'Second time point'), c('nSites > 50 KB onocogenes', 'nSites $\\leq$ 50 KB onocogenes'))
+  o[['early']] <- percent(o[['m']][1,2] / sum(o[['m']][1,]))
+  o[['late']]  <- percent(o[['m']][2,2] / sum(o[['m']][2,]))
+ 
+  sets <- split(d, d$patient)
+  o[['r']] <- bind_rows(mapply(function(x, n){
+    m <- matrix(c(n_distinct(x[x$timePointDays <   690 & abs(x[,distCol]) >   50000,]$patientPosid),
+                  n_distinct(x[x$timePointDays <   690 & abs(x[,distCol]) <=  50000,]$patientPosid),
+                  n_distinct(x[x$timePointDays >=  690 & abs(x[,distCol]) >   50000,]$patientPosid),
+                  n_distinct(x[x$timePointDays >=  690 & abs(x[,distCol]) <=  50000,]$patientPosid)), 
+                  byrow = TRUE, nrow=2)  
+
+    data.frame(subject=n,
+               earlyPercentNearOnco = (m[1,2]/sum(m[1,]))*100,
+               earlySites   =  paste0(ppNum(m[1,2]), ' / ', ppNum(m[1,1])),
+               latePercentNearOnco  = (m[2,2]/sum(m[2,]))*100,
+               lateSites   = paste0(ppNum(m[2,2]), ' / ', ppNum(m[2,1])))
+  }, sets, names(sets), SIMPLIFY=FALSE))
+
+
+  o[['w']] <- wilcox.test(o[['r']]$earlyPercentNearOnco, o[['r']]$latePercentNearOnco, paired = TRUE)
+  
+  o[['r']]$earlyPercentNearOnco <- paste0(round(o[['r']]$earlyPercentNearOnco, 2), '%')
+  o[['r']]$latePercentNearOnco <- paste0(round(o[['r']]$latePercentNearOnco, 2), '%')
+  names(o[['r']]) <- c('Subject', 'TP1 percent sites near oncogenes', 'TP1 sites near / far\nfrom oncogenes', 'TP2 percent sites near oncogenes', 'TP2 sites near / far\nfrom oncogenes')
+  o
+}
+
+fullOncoListTests <- testOncoGenes('nearestOncoFeatureDist')
+lymphomaOncoListTests <- testOncoGenes('nearestlymphomaFeatureDist')
+```
+\captionsetup[table]{labelformat=empty}
+
+**Full list of oncogenes considered (`r ppNum(n_distinct(gt23::humanOncoGenesList))` genes)**  
+When considering all subjects, a Fisher's exact test of unique intSites near oncogenes, comparing first time points 
+(`r fullOncoListTests$early` intSites near oncogenes) and second time points (`r fullOncoListTests$late` intSites near oncogenes), 
+showed a small yet significant depletion of intSites near oncogenes in the second time points 
+(p-value: `r formatC(fullOncoListTests$f$p.value, format = 'f', digits = 4)`).  
+
+```{r, echo=FALSE}
+m <- ppNum(fullOncoListTests$m)
+kable(m) 
+```
+
+For each of the six subjects, comparing the percentages of intSites near oncogenes from the first and second time points showed no significant difference 
+(paired Wilcoxcon test, p-value: `r formatC(fullOncoListTests$w$p.value, format = 'f', digits = 3)`).  
+
+```{r, echo=FALSE}
+row.names(fullOncoListTests$r) <- NULL
+kable(fullOncoListTests$r, format = "latex", align = 'c', booktabs = T, linesep = "") %>%
+  column_spec(2:5, width = "4cm") %>%
+  kable_styling(latex_options = c("striped"))
+```
+
+\vspace{0.5cm}
+
+**Lymphoma associated oncogenes considered (`r ppNum(n_distinct(gt23::humanLymphomaGenesList))` genes)**  
+When considering all subjects, a Fisher's exact test of unique intSites near oncogenes, comparing first time points 
+(`r lymphomaOncoListTests$early` intSites near oncogenes) and second time points (`r lymphomaOncoListTests$late` intSites near oncogenes), 
+no significant difference was found (p-value: `r formatC(lymphomaOncoListTests$f$p.value, format = 'f', digits = 2)`).  
+  
+```{r, echo=FALSE}
+m <- ppNum(lymphomaOncoListTests$m)
+kable(m)
+```
+
+For each of the six subjects, comparing the percentages of intSites near oncogenes from the first and second time points showed no significant difference 
+(paired Wilcoxcon test, p-value: `r formatC(lymphomaOncoListTests$w$p.value, format = 'f', digits = 3)`).
+
+```{r, echo=FALSE}
+row.names(lymphomaOncoListTests$r) <- NULL
+kable(lymphomaOncoListTests$r, format = "latex", align = 'c', booktabs = T, linesep = "") %>%
+  column_spec(2:5, width = "4cm") %>%
+  kable_styling(latex_options = c("striped"))
+```
+
+\newpage
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+library(RMySQL)
+invisible(sapply(DBI::dbListConnections(MySQL()), dbDisconnect))
+dbConn <- dbConnect(MySQL(), group = 'intSites_miseq')
+
+o <- bind_rows(lapply(SRA_samples$SpecimenAccNum, function(x){
+  run <- unname(unlist(dbGetQuery(dbConn,  paste0("select distinct miseqid from samples where sampleName like '", x, "-%'"))))
+  uninfectedReps <- length(unname(unlist(dbGetQuery(dbConn,  paste0("select distinct sampleName from samples where sampleName like 'UninfectedControl%' and miseqid='", run, "'")))))
+  notemplateReps <- length(unname(unlist(dbGetQuery(dbConn,  paste0("select distinct sampleName from samples where sampleName like 'NoTemplateControl%' and miseqid='", run, "'")))))
+  uninfectedReps <- ifelse(length(uninfectedReps) == 0, 0, uninfectedReps)
+  notemplateReps <- ifelse(length(notemplateReps) == 0, 0, notemplateReps)
+  
+  uninfected  <- unname(unlist(dbGetQuery(dbConn,  paste0("select distinct siteId from sites where sampleID in (select sampleID from samples where sampleName like 'UninfectedControl%' and miseqid='", run, "')"))))
+  notemplate <- unname(unlist(dbGetQuery(dbConn,  paste0("select distinct siteId from sites where sampleID in (select sampleID from samples where sampleName like 'NoTemplateControl%' and miseqid='", run, "')"))))
+  uninfected <- ifelse(length(uninfected) == 0, 0, length(uninfected))
+  notemplate <- ifelse(length(notemplate) == 0, 0, length(notemplate))
+  
+  uninfected <- ifelse(uninfectedReps == 0, NA, uninfected)
+  notemplate <- ifelse(notemplateReps == 0, NA, notemplate)
+  
+  data.frame(Sample = x, 
+             'Run' = run, 
+             'Unifected_control_replicates' = uninfectedReps, 
+             'Unifected_control_sites' = uninfected, 
+             'No_DNA_control_replicates' = notemplateReps,
+             'No_DNA_control_sites' = notemplate, 
+             check.names = FALSE)
+}))
+
+row.names(o) <- NULL
+
+o2 <- group_by(o, Run) %>%
+      summarise('Number of samples' = n_distinct(Sample),
+                'Uninfected control' = ifelse(sum(Unifected_control_replicates) > 0, 'Yes', 'No'),
+                'Uninfected control sites' = ifelse(sum(Unifected_control_replicates) > 0, sum(Unifected_control_sites), NA),
+                'No DNA control' = ifelse(sum(No_DNA_control_replicates) > 0, 'Yes', 'No'),
+                'No DNA control sites' = ifelse(sum(No_DNA_control_replicates) > 0, sum(No_DNA_control_sites), NA))
+```
+
+The table below shows the controls and results of those controls for each sequencing run used in this study. Four technical replicates 
+where employed for each control experiment. Two intSites were found in the uninfected control experiment for sequencing run 160426_M03249_0159_000000000-AM2PA 
+which included a single study sample (WAS7, m12/GRANULOCYTES, 879 intSites).  
+
+\vspace{1.0cm}
+
+```{r, echo=FALSE}
+o2 %>% kable(format = "latex", align='lccccc', booktabs = T, linesep = "", caption = "Sequencing experiment controls") %>%
+  column_spec(1, width = "7cm") %>%
+  column_spec(2:6, width = "2cm") %>%
+kable_styling(font_size = 10, latex_options = c("hold_position", "striped"))
+```
+

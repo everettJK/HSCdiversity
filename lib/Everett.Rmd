@@ -1,0 +1,803 @@
+---
+fontsize: 11pt
+geometry: margin=0.25in
+output:
+  pdf_document:
+    keep_tex: yes
+    latex_engine: xelatex
+---
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+options(stringsAsFactors = FALSE, useFancyQuotes = FALSE)
+load('Everett.RData')
+library(knitr)
+library(stringr)
+library(png)
+library(grid)
+library(gridExtra)
+library(wordcloud)
+library(RColorBrewer)
+library(grDevices)
+library(vegan)
+library(gtools)
+library(reshape2)
+library(scales)
+library(pander)
+library(ggrepel)
+library(reldist)
+library(UpSetR)
+library(rsvg)
+library(tidyverse)
+
+convertName <- function(x){
+  nameConversion <- data.frame(internal=c('FR01', 'FR03', 'FR04', 'FR05',  'p1204', 'p1202', 'All'), 
+                               external=c('WAS2', 'WAS4', 'WAS5', 'WAS7',  'bS/bS', 'b0/bE', 'All')) 
+  
+  nameConversion[match(tolower(x), tolower(nameConversion$internal)),]$external
+}
+
+# Convenience function for formatting percentages
+ppNum <- function(n) format(n, big.mark = ",", scientific = FALSE, trim = TRUE)
+
+
+# Function for parsing heatmap SVG files and creating a data frame that can 
+# be used to recreate the heatmap with ggplot.
+
+genomicHeatmap2dataframe <- function(file){
+  f <- unlist(strsplit(readChar(file, file.info(file)$size), '\n'))
+  f <- gsub('<polygon points', '<rect x', f)
+  d <- data.frame(x = str_match(f[grep('<rect x=', f)], '<rect x=\\"([\\d\\.]+)')[,2],
+                  f = str_match(f[grep('<rect x=', f)], 'fill=\\"([^\\"]+)')[,2])
+  d <- d[1:rev(which(d$x==d$x[1]))[1]-1,]
+  d$x <- as.integer(factor(d$x, levels=unique(d$x)))
+  rowNames <- gsub('<\\/?desc1>', '', f[grep('Compare rows', f)+1])
+  colNames <- gsub('<\\/?desc1>', '', f[grep('Compare columns', f)+1])
+  
+  colorScale <<- data.frame(color = str_match(f[(grep('Key', f)+1):(grep('Key', f)+21)], 'fill=\\"([^\\"]+)')[,2],
+                           score = seq(from=0, to=1, by=0.05))
+  
+  d$sample <- colNames[d$x]
+  d$test   <- factor(rowNames, levels=unique(rowNames))
+  d$score  <- colorScale[match(d$f, colorScale$color),]$score
+  
+  if(all(grepl('\\.', as.character(d$sample)))){
+    d$cellType <- unlist(lapply(str_split(d$sample, '\\.'), '[[', 2))
+    d <- do.call(rbind, lapply(split(d, d$cellType), function(x){ x }))
+  }
+  
+  d$sample <- factor(d$sample, levels=unique(d$sample))
+  d
+}
+
+
+
+# Function for plotting the data obtained from genomicHeatmap2dataframe().
+
+genomicHeatmap <- function(d, tileColors=colorRampPalette(c('blue4', 'white', 'gold3'))(21)){
+
+  heatmap_dims <- function(p) {
+  .x <- as.character(p$mapping$x)
+  .y <- as.character(p$mapping$y)
+  ncols <- length(unique(p$data[[.x]]))
+  nrows <- length(unique(p$data[[.y]]))
+  return(list(ncols=ncols, nrows=nrows))
+  }
+  
+  make_square <- function(p, fudge=1) {
+    dims <- heatmap_dims(p)
+    p + ggplot2::theme(aspect.ratio = (dims$nrows/dims$ncols)*fudge)
+  }
+  
+  p <- ggplot(d, aes(sample, test, fill=score)) + 
+       theme_bw() +
+       labs(x='', y='') +
+       geom_tile(color='black') +
+       scale_x_discrete(position = "top") +
+       scale_fill_gradientn(colors=tileColors,
+                            breaks=seq(from=0, to=1, by=0.2),
+                            labels=seq(from=0, to=1, by=0.2),
+                            limits=c(0,1),
+                            name='Color Key') +
+       theme(axis.text.x=element_text(angle=90, hjust=0),
+             #legend.position="bottom",
+             plot.background = element_blank(),
+             panel.grid.major = element_blank(),
+             panel.grid.minor = element_blank(),
+             panel.border = element_blank())
+  
+  make_square(p)
+}
+
+  
+# Reassemble berryDrep data frame in order to get the read data.
+if(! file.exists('../data/berryDrep.csv.gz')) system('cat ../data/berryDrep* > ../data/berryDrep.csv.gz')
+ise <- read.csv(gzfile('../data/berryDrep.csv.gz'))
+
+d <- intSites
+d$patient <- convertName(d$patient)
+
+table1 <- do.call(rbind, lapply(split(d, d$patient), function(x){
+  o <- subset(ise, sampleName  %in% as.character(unique(x$sampleName)))
+  data.frame(Patient=x$patient[1], 
+             'Number of ISs'=ppNum(length(unique(x$posid))), 
+             'Sequence Reads'=ppNum(sum(o$readCounts)), 
+             check.names = FALSE)
+}))
+row.names(table1) <- NULL
+
+table2 <- data.frame(do.call(rbind, lapply(unique(d$celltype), function(x){
+  o <- ppNum(sapply(unique(d$patient), function(x2){length(unique(subset(d, celltype==x & patient==x2)$posid))}))
+  c(setNames(c(as.character(x)), c("Samples")), o)
+})), check.names = FALSE)
+row.names(table2) <- NULL
+```
+
+**Table Everett A.**  
+Total number of unique integration sites and uniquely mapped sequence reads.  
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, error=FALSE, cache=FALSE}
+kable(table1)
+```
+
+\vspace{1.0cm}
+
+**Table Everett B.**  
+Cumulative number of unique integration sites retrieved from different sample types.  
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, error=FALSE, cache=FALSE}
+kable(table2)
+```
+
+\vspace{1.0cm}
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, error=FALSE, cache=FALSE}
+a <- data.frame(readRDS('../data/WAS_d0_intSites.rds'))
+b <- data.frame(intSites)
+
+m <- matrix(c(length(unique(subset(a, nearestOncoFeature50K == FALSE)$posid)),
+              length(unique(subset(a, nearestOncoFeature50K == TRUE)$posid)),
+              length(unique(subset(b, nearestOncoFeature50K == FALSE)$posid)),
+              length(unique(subset(b, nearestOncoFeature50K == TRUE)$posid))),
+            byrow = TRUE,
+            nrow  = 2)
+
+row.names(m) <- c('d0 intSites', 'Lineage intSites')
+colnames(m) <- c('Not near oncogenes 50K', 'Near oncogenes 50K')
+
+m.fisher.pval <- as.character(signif(fisher.test(m)$p.value, digits=3))
+```
+
+**Table Everett C.**  
+Enrichment of intSites near oncogenes in lineage tracing intSites compared to d0 intSites (WAS2, WAS4, WAS5, WAS7).   
+
+\vspace{0.5cm}
+
+There is an `r percent(m[2,2]/sum(m[2,]) - m[1,2]/sum(m[1,]))` increase in the number of intSites within 50KB of oncogenes in the lineage tracing data 
+set compared to the d0 intSite data set (454 data, Fisher's exact test p-value: `r m.fisher.pval`)  
+
+\vspace{1.0cm}
+
+```{r, echo=FALSE, cache=FALSE}
+pander(ppNum(m))
+```
+
+\newpage
+
+**Table Everett D.**  
+
+```{r, echo=FALSE, cache=FALSE}
+intSites$patientPosid <- paste(intSites$patient, intSites$posid)
+
+sets <- split(intSites, intSites$patient)
+sets$All <- intSites
+
+percent <- function(x, digits = 2, format = "f", ...) paste0(formatC(100 * x, format = format, digits = digits, ...), "%")
+
+r <- do.call(rbind, mapply(function(x, n){
+  m <- matrix(c(n_distinct(subset(x, timePointDays <  dividingTimePointDays & nearestOncoFeature50K == FALSE)$patientPosid),
+                n_distinct(subset(x, timePointDays <  dividingTimePointDays & nearestOncoFeature50K == TRUE)$patientPosid),
+                n_distinct(subset(x, timePointDays >= dividingTimePointDays & nearestOncoFeature50K == FALSE)$patientPosid),
+                n_distinct(subset(x, timePointDays >= dividingTimePointDays & nearestOncoFeature50K == TRUE)$patientPosid)), 
+                byrow = TRUE, nrow=2)
+  f <- fisher.test(m)
+  #browser()
+  data.frame(subject=n,
+             Fishers_Pval = f$p.value,
+             EarlyPercentNearOnco = percent(m[1,2]/ n_distinct(subset(x, timePointDays <  dividingTimePointDays)$patientPosid)),
+             LatePerentNearOnco = percent(m[2,2]/ n_distinct(subset(x, timePointDays >=  dividingTimePointDays)$patientPosid)))
+}, sets, names(sets), SIMPLIFY=FALSE))
+
+
+r <- r[order(r$Fishers_Pval),]
+row.names(r) <- NULL
+r$subject <- convertName(r$subject)
+pander(r)
+```
+
+
+
+
+\vspace{1.0cm}
+
+**Figure Everett A.**  
+
+```{r, Everett_A, fig.width=8, dev='svg'}
+
+calculateUC50 <- function(abund){
+  stopifnot(is.vector(abund) & is.numeric(abund))
+  abund <- abund[order(abund)]
+  accum <- sapply(1:length(abund), function(i){sum(abund[1:i])})
+  length(accum[accum >= sum(abund)/2])
+}
+
+plotData <- do.call(rbind, lapply(split(intSites, paste(intSites$patient, intSites$celltype, intSites$timepoint)), function(x){
+  d <- x$estAbund
+  names(d) <- x$posid
+  data.frame(patient   = x$patient[1],
+             timepoint = x$timepoint[1],
+             celltype  = x$celltype[1],
+             tp        = ifelse(x$timePointDays[1] < dividingTimePointDays, '1st time point', '2nd time point'),
+             gini      = gini(x$estAbund),
+             shannon   = diversity(d),
+             pielou    = diversity(d)/log(specnumber(d)),
+             uc50      = calculateUC50(x$estAbund))
+}))
+
+###plotData$timepoint <- gsub('m12_6', 'm12', plotData$timepoint)
+
+
+### plotData <- subset(plotData, timepoint %in% SRA_samples$Timepoint)
+
+plotData$timepoint <- gsub('m', '', plotData$timepoint)
+plotData$timepoint <- factor(plotData$timepoint, levels=unique(mixedsort(plotData$timepoint)))
+
+plotData$celltype <- factor(as.character(plotData$celltype), levels = c("MONOCYTES", "GRANULOCYTES", "BCELLS", "NKCELLS", "TCELLS"))
+
+plotData$patient <- convertName(plotData$patient)
+
+ggplot(plotData, aes(timepoint, pielou, color=patient, shape=tp)) +
+  theme_bw() +
+  scale_shape_manual(values=c(16, 15)) +
+  geom_point(size=3) +
+  scale_color_manual(values=colorRampPalette(brewer.pal(12, "Paired"))(6)) +
+  facet_grid(.~celltype) +
+  theme(legend.position="bottom") +
+  labs(x='Time point (months)', y='Pielou index') +
+  guides(color = guide_legend(title="Patient", title.position = "top"),
+         shape = guide_legend(title="Time point", title.position = "top"))
+
+```
+
+
+```{r,}
+knitr::knit_exit()
+```
+
+\newpage
+
+**Figure Everett B.**  
+Integration were divided between the two time points and the integration frequency (n sites near gene X / all sites) 
+within 50KB of genes shown below. Genes above the blue line are genes with a higher integration frequency in the later 
+time point compared to earlier time point and these integrations may confer a survival or proliferation advantage to cells harboring 
+integration sites near those genes. Genes with an integration frequency more than 0.0004 off the diagonal are labeled.
+
+```{r, Everett_B, echo=FALSE, warning=FALSE, eval=TRUE, fig.width=8, fig.height=7, dev='png', dpi=300, cache=FALSE}
+# Determine the number of sites in the pre- and post- samples for the axis labels.
+preSites  <- ppNum(length(unique(subset(intSites, timePointDays <= dividingTimePointDays)$posid)))
+postSites <- ppNum(length(unique(subset(intSites, timePointDays > dividingTimePointDays)$posid)))
+
+# Create a fill vector for gene data points.
+pvp.plotData$geneFill <- ifelse(pvp.plotData$oncoGene, 'Onogene','Non-oncogene')
+pvp.plotData$geneFill <- factor(pvp.plotData$geneFill, levels=c('Non-oncogene', 'Onogene'))
+
+# Reorder the plot so that the more interesting genes are at the bottom and will be rendered on top of the plot.
+pvp.plotData <- pvp.plotData[order(as.integer(pvp.plotData$geneFill)),]
+
+# Determine which genes to label
+pvp.plotData$dist <- pvp.plotData$postIntFreq - pvp.plotData$preIntFreq
+genesToLabel1 <- as.character(subset(pvp.plotData, dist >= 0.0004)$gene)
+genesToLabel2 <- as.character(subset(pvp.plotData, dist <= -0.0004)$gene)
+
+set.seed(10101)
+
+ggplot(pvp.plotData, aes(x=preIntFreq, y=postIntFreq, fill=geneFill, size=maxAbund)) +
+  theme_bw() + 
+  scale_fill_manual(values=c('black', 'red')) +
+  geom_point(shape=21) +
+  labs(x=paste0('Time point 1 integration frequency (', preSites, ' sites)'),
+       y=paste0('Time point 2 integration frequency (', postSites, ' sites)')) + 
+  geom_abline(slope=1, intercept=0, color='blue') +
+  geom_text(data=subset(pvp.plotData, gene %in% genesToLabel1), nudge_x = 0.00015,  nudge_y = +0.00015, size=3, aes(label=gene), check_overlap = TRUE, vjust=0, hjust=1) +
+  geom_text(data=subset(pvp.plotData, gene %in% genesToLabel2), nudge_x = 0.00015,  nudge_y = -0.00015, size=3, aes(label=gene), check_overlap = TRUE, vjust=0, hjust=0) +
+  guides(fill=guide_legend(title="Gene category"),
+         size=guide_legend(title="Max clonal abundance"))
+```
+
+\newpage
+
+**Figure Everett C.**  
+The integration frequency (n sites near gene X / all sites) within 50KB of genes for integration sites identified in both patient pre-transplant
+and final timepoint samples is shown below. There is approximately a 10 fold difference in the number of pre- and post-transplant samples (see axis labels). 
+Genes above the blue line are genes with a higher integration frequency in the later time point compared to earlier time point and these integrations may 
+confer a survival or proliferation advantage to cells harboring integration sites near those genes. Genes with an integration frequency more than 0.0018 
+off the diagonal are labeled. Data points were jitteres +/- 0.00005.
+
+```{r, Everett_C, echo=FALSE, warning=FALSE, eval=TRUE, fig.width=8, fig.height=7, dev='png', dpi=300, cache=FALSE}
+# Determine the number of sites in the pre- and post- samples for the axis labels.
+preSites  <- ppNum(length(unique(subset(d0vs2ndTimePoint, timePointDays == 0)$posid)))
+postSites <- ppNum(length(unique(subset(d0vs2ndTimePoint, timePointDays >  0)$posid)))
+
+# Create a fill vector for gene data points.
+pvp.plotData2$geneFill <- ifelse(pvp.plotData2$oncoGene, 'Onogene','Non-oncogene')
+pvp.plotData2$geneFill <- factor(pvp.plotData2$geneFill, levels=c('Non-oncogene', 'Onogene'))
+
+# Reorder the plot so that the more interesting genes are at the bottom and will be rendered on top of the plot.
+pvp.plotData2 <- pvp.plotData2[order(as.integer(pvp.plotData2$geneFill)),]
+
+# Determine which genes to label
+pvp.plotData2$dist <- pvp.plotData2$postIntFreq - pvp.plotData2$preIntFreq
+genesToLabel1 <- as.character(subset(pvp.plotData2, dist >= 0.0018)$gene)
+genesToLabel2 <- as.character(subset(pvp.plotData2, dist <= -0.0018)$gene)
+
+pvp.plotData2$geneLabel <- ''
+pvp.plotData2[which(pvp.plotData2$gene %in% c(genesToLabel1, genesToLabel2)),]$geneLabel <- as.character(pvp.plotData2[which(pvp.plotData2$gene %in% c(genesToLabel1, genesToLabel2)),]$gene)
+
+set.seed(10101)
+
+pvp.plotData2$preIntFreq <- jitter(pvp.plotData2$preIntFreq, amount = 0.00005)
+pvp.plotData2$postIntFreq <- jitter(pvp.plotData2$postIntFreq, amount = 0.00005)
+
+ggplot(pvp.plotData2, aes(x=(preIntFreq), y=(postIntFreq), fill=geneFill, size=maxAbund)) +
+  theme_bw() + 
+  scale_fill_manual(values=c('black', 'red')) +
+  geom_point(shape=21) +
+  labs(x=paste0('Pre-transplant samples (', preSites, ' sites)'),
+       y=paste0('Final patient timepoint samples (', postSites, ' sites)')) + 
+  geom_abline(slope=1, intercept=0, color='blue') +
+  geom_text_repel(data=pvp.plotData2,
+                  size=3,
+                  point.padding=0.4,
+                  box.padding=0.5,
+                  ylim=c(0.002,NA),
+                  aes(label=geneLabel)) +
+  guides(fill=guide_legend(title="Gene category"),
+         size=guide_legend(title="Max clonal abundance"))
+  
+```
+
+\newpage
+
+**Figure Everett D.**  
+Clonal populations with integration sites near the most proximal genes of the most abundant 30 clones (Uncorrected abundances). 
+Genes considered human oncogenes are colored red.  
+
+\vspace{1.0cm}
+
+```{r, Everett_D, echo=FALSE, eval=TRUE, warning=FALSE, error=FALSE, fig.width=8, fig.height=8, cache=FALSE, dev='png', dpi=300}
+d <- intSites
+
+# Bin abundances into 5 cell bins.
+d$estAbund <- cut(d$estAbund, breaks = seq(from=0, to=500, by=5), labels=FALSE)
+d$estAbund <- d$estAbund * 5
+
+d <- d[rev(order(d$estAbund)),]
+genes <- unique(d$nearestFeature)[1:30]
+
+plotData <- do.call(rbind, lapply(genes, function(x){
+  o <- data.frame(table(subset(d, nearestFeature==x)$estAbund))
+  o$gene <- x
+  names(o) <- c('estAbund', 'nClones', 'gene')
+  o$estAbund <- as.numeric(as.character(o$estAbund))
+  o
+}))
+
+# Hot fix
+genes[which(genes=="IQCJ-SCHIP1,SCHIP1")] <- "SCHIP1"
+plotData[which(plotData$gene=="IQCJ-SCHIP1,SCHIP1"),]$gene <- "SCHIP1"
+
+plotData$gene <- factor(plotData$gene, levels=rev(genes))
+plotData$s <- cut(plotData$nClones, 
+                  breaks=c(0,1,5,10,50,Inf), 
+                  labels=c('1 clone', '2-5 clones', '6-10 clones', '11-50 clones', '> 50 clones'))
+
+
+ axisLabelColor <- sapply(levels(plotData$gene), function(x){ 
+    ifelse(x %in% toupper(inSite::humanOncoGenesList), 'red', 'black') 
+  })
+ 
+ggplot(plotData, aes(gene, estAbund, size=s)) +
+  theme_bw() +
+  geom_point(shape=1) +
+  labs(x='Gene name', y='Abundance (5 cell bins)') +
+  scale_size_discrete(range = c(1,5), name='') +
+  theme(axis.text.x=element_text(angle=90, hjust=1, color=axisLabelColor))
+```
+
+
+\newpage
+
+**Figure Everett E.**  
+Shannon indices of recovered intSite populations (all time points, uncorrected abundances).  
+
+\vspace{1.0cm}
+  
+```{r, Everett_E, echo=FALSE, eval=TRUE, message=FALSE, warning=FALSE, fig.width=8, fig.height=7, cache=FALSE, dev='png', dpi=300}  
+plotData <- do.call(rbind, lapply(split(intSites.allTimePoints, paste(intSites.allTimePoints$patient, intSites.allTimePoints$timepoint, intSites.allTimePoints$celltype)), function(x){
+  data.frame(patient      = x$patient[1],
+             timePoint    = x$timepoint[1],
+             celltype     = x$celltype[1],
+             ShannonIndex = diversity(x$estAbund))
+  }))
+row.names(plotData) <- NULL
+
+plotData$timePoint <- as.character(plotData$timePoint)
+plotData <- plotData[mixedorder(plotData$timePoint),]
+
+### plotData <- subset(plotData, tolower(timePoint) %in% tolower(SRA_samples$Timepoint))
+
+plotData$timePoint <- gsub('m', '', plotData$timePoint)
+plotData$timePoint <- gsub('_\\d+', '', plotData$timePoint)
+plotData$timePoint <- as.numeric(plotData$timePoint)
+plotData$timePoint <- factor(plotData$timePoint, levels=unique(sort(plotData$timePoint)))
+
+plotData$celltype <- factor(plotData$celltype, levels = toupper(c('Monocytes', 'GRANULOCYTES', 'Bcells', 'NKcells', 'Tcells')))
+  
+plotData$patient <- convertName(plotData$patient)
+
+plotData.save <- plotData
+
+ggplot(plotData, aes(y=ShannonIndex, x=timePoint, color=patient)) +
+  theme_bw() +
+  geom_point(size=3) +
+  geom_line(aes(group=patient)) +
+  scale_color_manual(values=colorRampPalette(brewer.pal(12, "Paired"))(6)) +
+  ylim(0,11) +
+  facet_grid(celltype~.)  +
+  theme(legend.position = "bottom") +
+  labs(x='Time point (months)', y='Shannon index') +
+  guides(color=guide_legend(ncol=6))
+```  
+
+
+\newpage
+
+**Figure Everett F.**  
+
+```{r, Everett_F, echo=FALSE, eval=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+invisible(lapply(split(intSites, intSites$patient), function(x){
+  o <- lapply(split(x, x$nearestFeature), function(x2){ setNames(max(x2$estAbund), x2$nearestFeature[1]) })
+  o <- o[order(unlist(o), decreasing = TRUE)]
+  maxWords <- 250
+  if(length(o) < maxWords) maxWords <- length(o)
+  png(file = paste0('../data/tmp/', x$patient, '_wordCloud.png'))
+  wordcloud(names(o)[1:maxWords], unname(unlist(o))[1:maxWords], random.order=FALSE, colors=colorRampPalette(brewer.pal(12, "Paired"))(50), rot.per=0)
+  dev.off()
+}))
+```
+
+
+WAS2 & WAS4 most abundant proximal genes (all cell types & all time points).  
+
+```{r, Everett_F1, echo=FALSE, eval=TRUE, out.width='75%', cache=FALSE, dev='png', dpi=300}
+img1 <-  rasterGrob(as.raster(readPNG("../data/tmp/FR01_wordCloud.png")), interpolate = FALSE)
+img2 <-  rasterGrob(as.raster(readPNG("../data/tmp/FR03_wordCloud.png")), interpolate = FALSE)
+grid.arrange(img1, img2, ncol = 2)
+```
+  
+   
+WAS5 & WAS7 most abundant proximal genes (all cell types & all time points).  
+
+```{r,Everett_F2, echo=FALSE, eval=TRUE, out.width='75%', cache=FALSE, dev='png', dpi=300}
+img1 <-  rasterGrob(as.raster(readPNG("../data/tmp/FR04_wordCloud.png")), interpolate = FALSE)
+img2 <-  rasterGrob(as.raster(readPNG("../data/tmp/FR05_wordCloud.png")), interpolate = FALSE)
+grid.arrange(img1, img2, ncol = 2)
+```
+
+$\beta$S/$\beta$S & $\beta$$0$/$\beta$E  most abundant proximal genes (all cell types & all time points).  
+
+```{r, Everett_F3, echo=FALSE, eval=TRUE, out.width='75%', cache=FALSE, dev='png', dpi=300}
+img1 <-  rasterGrob(as.raster(readPNG("../data/tmp/p1204_wordCloud.png")), interpolate = FALSE)
+img2 <-  rasterGrob(as.raster(readPNG("../data/tmp/p1202_wordCloud.png")), interpolate = FALSE)
+grid.arrange(img1, img2, ncol = 2)
+```
+
+\newpage
+
+**Figure Everett G.**    
+Proportion of cell types contributing to identified intSites (last patient time points shown).  
+
+\vspace{1.0cm}
+
+```{r, Everett_G1, echo=FALSE, eval=TRUE, fig.height=9, fig.width=8, cache=FALSE, dev='png', dpi=300}
+plotData <- do.call(rbind, lapply(c('FR03|m36|Blood', 'FR04|m36|Blood', 'FR01|m48|Blood', 'FR05|m30|Blood', 'p1204|m24|Blood', 'p1202|m36|Blood'), function(x){
+  patient <- unlist(str_split(x, '\\|'))[1]
+  
+  timePoint <- unlist(str_split(x, '\\|'))[2]
+  
+  counts <- crossOverReports[[x]]$cellCount
+  names(counts) <- cellTypes
+  counts <- as.data.frame(t(counts))
+  row.names(counts) <- 'Blood cell counts'
+  
+  IScounts <- sapply(cellTypes, function(x2){
+    d <- subset(intSites, patient==patient & celltype==x2 & timepoint==timePoint)
+    length(unique(d$posid))
+  })
+  IScounts <- as.data.frame(t(IScounts/sum(IScounts)))
+  row.names(IScounts) <- 'All intSites'
+  
+  hiIScounts <- sapply(cellTypes, function(x2){
+    d <- subset(intSites, patient==patient & celltype==x2 & timepoint==timePoint & estAbund > 2)
+    length(unique(d$posid))
+  })
+  hiIScounts <- as.data.frame(t(hiIScounts/sum(hiIScounts)))
+  row.names(hiIScounts) <- 'High abund intSites'
+  
+  plotData   <- melt(as.matrix(rbind(counts, IScounts, hiIScounts)))
+  
+  patient <- convertName(patient)
+  
+  plotData$f <- paste(patient, timePoint)
+  plotData
+}))
+
+plotData$Var2 <- factor(as.character(plotData$Var2), levels = toupper(c('Monocytes', 'GRANULOCYTES', 'Bcells', 'NKcells', 'Tcells')))
+
+ggplot(plotData, aes(x=Var1, y=value, fill=Var2)) +
+    theme_bw() +
+    geom_bar(stat='identity') +
+    scale_fill_manual(values=c('#d7191c', '#fdae61', '#ffffbf', '#abdda4', '#2b83ba')) +
+    labs(x='', y='Cell types proportions') +
+    guides(fill=guide_legend(title='')) +
+    scale_y_continuous(labels = scales::percent) +
+    theme(legend.position="bottom") +
+    facet_grid(f~.)
+```
+
+\newpage
+
+```{r, Everett_G2, echo=FALSE, eval=TRUE, cache=FALSE, dev='png', dpi=300}
+d <- intSites 
+
+plotData <- do.call(rbind, lapply(split(d, d$patient), function(x){
+  data.frame(patient=x$patient,
+             estAbund=x$estAbund)
+}))
+
+
+d[which(!is.na(d$estAbund2)),]$estAbund <- d[which(!is.na(d$estAbund2)),]$estAbund2
+
+plotDataCorrected <- do.call(rbind, lapply(split(d, d$patient), function(x){
+  data.frame(patient=x$patient,
+             estAbund=x$estAbund)
+}))
+
+# The correction appears to be lowering some values below 1 which breaks the log transformation.
+plotDataCorrected[which(plotDataCorrected$estAbund < 1),]$estAbund <- 1
+```
+
+**Figure Everett H.**  
+Distributions of intSite abundances.  
+
+\vspace{0.5cm}
+
+Uncorrected abundances.   
+```{r, Everett_H, echo=FALSE, eval=TRUE, fig.height=4, dev='png', dpi=300, cache=FALSE, dev='png', dpi=300}
+plotData$patient <- convertName(plotData$patient)
+
+ggplot(plotData, aes(x=patient, y=log10(estAbund))) +
+  theme_bw() +
+  geom_violin(scale='width', adjust=7) +
+  geom_jitter(height=0, width=0.1, alpha=0.5) +
+  labs(x='', y='log10 abundance')
+```
+
+\vspace{1.0cm}
+
+Corrected abundances (Weighted confusion).    
+```{r, Everett_H_weighted,echo=FALSE, eval=TRUE, fig.height=4, dev='png', dpi=300, cache=FALSE, dev='png', dpi=300}
+plotDataCorrected$patient <- convertName(plotDataCorrected$patient)
+
+ggplot(plotDataCorrected, aes(x=patient, y=log10(estAbund))) +
+  theme_bw() +
+  geom_violin(scale='width', adjust=7) +
+  geom_jitter(height=0, width=0.1, alpha=0.5) +
+  labs(x='', y='log10 Weighted confusion corrected abundance')
+```
+
+\newpage
+
+**Figure Everett I.**  
+Shared integration sites between cell types (all patients and time points considered).  
+
+\vspace{1.0cm}
+
+
+```{r, Everett_I, echo=FALSE, warning=FALSE, message=FALSE, error=FALSE, include=FALSE, eval=TRUE, cache=FALSE, dev='png', dpi=300}
+d <- intSites.wide
+o <- as.matrix(d[3:7])
+o[o>0] <- 1
+o <- data.frame(o)
+o$Name <- d$integrationSite
+o <- o[,c(6,1,2,3,4,5)]
+
+fileName <- '../data/tmp/UpSet.svg'
+svg(file=fileName)
+upset(o, order.by = "freq", show.numbers = FALSE, point.size=4, mainbar.y.label='Integration sites')
+dev.off()
+f <- unlist(strsplit(readChar(fileName, file.info(fileName)$size), '\n'))
+
+f[grep('viewBox', f)] <- sub('viewBox=\"0', 'viewBox=\"100', f[grep('viewBox', f)])
+f[grep('viewBox', f)] <- sub('\\d+\\s+\\d+"\\s+version', '404 504\\" version', f[grep('viewBox', f)])
+
+write(file='../data/tmp/updatedUpSet.svg',
+      f[-((length(f)-grep('^</g>', rev(f))[6]+1):(length(f)-grep('^</g>', rev(f))[2]))])
+
+rsvg_png("../data/tmp/updatedUpSet.svg", "../data/tmp/updatedUpSet.png", height=2018)
+```
+
+
+```{r, Everett_upset, echo=FALSE, eval=TRUE, fig.height=8, fig.width=8, cache=FALSE, dev='png', dpi=300}
+img <- readPNG("../data/tmp/updatedUpSet.png")
+grid.raster(img)
+```
+
+\newpage
+
+**Figure Everett J.**  
+intSites shared between time points (Uncorrected data, only intSites with abundances $\geq$ 2).   
+
+\vspace{1.0cm}
+
+```{r, Everett_J, echo=FALSE, eval=TRUE, fig.width=8, fig.height=9, cache=FALSE, dev='png', dpi=300}
+d <- do.call(rbind, lapply(c('FR01 m22/m48', 'FR05 m12/m30', 'FR03 m12/m36', 'FR04 m12_6/m36', 'p1204 m12/m24', 'p1202 m11/m36'), function(x){
+  patientID <- unlist(str_split(x, '\\s+'))[1]
+  timePoints <- unlist(str_split(unlist(str_split(x, '\\s+'))[2], '\\/'))
+  d <- subset(intSites, patient==patientID & timepoint %in% timePoints & celltype %in% cellTypes & estAbund > 2)
+  d$celltype <- factor(as.character(d$celltype), levels=unique(as.character(d$celltype)))
+  
+  do.call(rbind, lapply(split(d, d$celltype), function(x2){
+    
+    s1 <- unique(subset(x2, timepoint == timePoints[1])$posid)
+    s2 <- unique(subset(x2, timepoint == timePoints[2])$posid)
+    shared <- length(intersect(s1, s2)) / length(unique(x2$posid))
+    s1Only <- length(setdiff(s1, s2))   / length(unique(x2$posid))
+    s2Only <- length(setdiff(s2, s1))   / length(unique(x2$posid))
+    df <- data.frame(v  = c(shared, s1Only, s2Only),
+                     wt = c('Shared', 'First timepoint only', 'Second timepoint only'),
+                     pt = x2$patient[1],
+                     ct = as.character(x2$celltype[1]))
+  }))
+}))
+
+
+d$ct <- factor(d$ct, levels =c("MONOCYTES", "GRANULOCYTES", "BCELLS", "NKCELLS", "TCELLS"))  # JKE
+
+# Remove the one bar chart for which we do not have two time points.
+d[which(d$pt=='FR05' & d$ct=='NKCELLS'),]$v <- 0
+
+d$pt <- convertName(d$pt)
+
+ggplot(d, aes(ct, v, fill=wt)) +
+  theme_bw() +
+  scale_fill_manual(values=c('#b35806', '#f1a340', '#fee0b6')) + 
+  geom_bar(stat='identity') +
+  scale_y_continuous(labels = scales::percent) +
+  guides(fill=guide_legend(title="Time points")) +
+  labs(x='Cell type', y='Percent intSites') +
+  theme(legend.position="bottom") +
+  facet_grid(pt~.)
+```
+
+\newpage
+
+Figure Everett X. Genomic and Epigenetic heatmaps.
+
+```{r Everett_X, fig.height=8, fig.width=9, echo=FALSE, dev='png', dpi=300}
+a <- genomicHeatmap(genomicHeatmap2dataframe("../data/tmp/GEN_all/main.svg"), tileColors = colorScale$color)
+b <- genomicHeatmap(genomicHeatmap2dataframe("../data/tmp/EPI_all/main.svg"))
+
+a <- a + ggtitle('Genomic heat map (all subjects)')
+b <- b + ggtitle('Epigenetic heat map (all subjects)')
+
+grid.arrange(a, b, ncol = 2)
+```
+
+\newpage
+
+Figure Everett Y. (genomic heatmaps)  
+Genomic heat map for patient WAS2  
+
+```{r Everett_Y, fig.height=8, fig.width=9, echo=FALSE, cache=FALSE, dev='png', dpi=300}
+genomicHeatmap(genomicHeatmap2dataframe("../data/tmp/FR01/main.svg"), tileColors = colorScale$color)
+```
+
+\newpage
+
+Genomic heat map for patient WAS4  
+
+```{r WAS4_map, fig.height=8, fig.width=9, echo=FALSE, cache=FALSE, dev='png', dpi=300}
+genomicHeatmap(genomicHeatmap2dataframe("../data/tmp/FR03/main.svg"), tileColors = colorScale$color)
+```
+
+\newpage
+
+Genomic heat map for patient WAS5  
+
+```{r WAS5_map, fig.height=8, fig.width=9, echo=FALSE, cache=FALSE, dev='png', dpi=300}
+genomicHeatmap(genomicHeatmap2dataframe("../data/tmp/FR04/main.svg"), tileColors = colorScale$color)
+```
+
+\newpage
+
+Genomic heat map for patient WAS7  
+
+```{r WAS7_map, fig.height=8, fig.width=9, echo=FALSE, cache=FALSE, dev='png', dpi=300}
+genomicHeatmap(genomicHeatmap2dataframe("../data/tmp/FR05/main.svg"), tileColors = colorScale$color)
+```
+
+\newpage
+
+Genomic heat map for patient $\beta$$0$/$\beta$E  
+
+```{r b0bE_map, fig.height=8, fig.width=9, echo=FALSE, cache=FALSE, dev='png', dpi=300}
+genomicHeatmap(genomicHeatmap2dataframe("../data/tmp/p1202/main.svg"), tileColors = colorScale$color)
+```
+
+\newpage
+
+Genomic heat map for patient $\beta$S/$\beta$S  
+
+```{r bsbs_map, fig.height=8, fig.width=9, echo=FALSE, cache=FALSE, dev='png', dpi=300}
+genomicHeatmap(genomicHeatmap2dataframe("../data/tmp/p1204/main.svg"), tileColors = colorScale$color)
+```
+
+\newpage
+
+Figure Everett Z. (Epigenetic heatmaps)  
+  
+Epigenetic heat map for patient WAS2  
+
+```{r Everett_Z, fig.height=8, fig.width=6, echo=FALSE, cache=FALSE, dev='png', dpi=300}
+genomicHeatmap(genomicHeatmap2dataframe("../data/tmp/EPI_FR01/main.svg"))
+```
+
+\newpage
+
+Epigenetic heat map for patient WAS4  
+
+```{r WAS4_epi, fig.height=8, fig.width=6, echo=FALSE, cache=FALSE, dev='png', dpi=300}
+genomicHeatmap(genomicHeatmap2dataframe("../data/tmp/EPI_FR03/main.svg"))
+```
+
+\newpage
+
+Epigenetic heat map for patient WAS5
+
+```{r WAS5_epi, fig.height=8, fig.width=6, echo=FALSE, cache=FALSE, dev='png', dpi=300}
+genomicHeatmap(genomicHeatmap2dataframe("../data/tmp/EPI_FR04/main.svg"))
+```
+
+\newpage
+
+Epigenetic heat map for patient WAS7 
+
+```{r WAS7_epi, fig.height=8, fig.width=6, echo=FALSE, cache=FALSE, dev='png', dpi=300}
+genomicHeatmap(genomicHeatmap2dataframe("../data/tmp/EPI_FR05/main.svg"))
+```
+
+\newpage
+
+Epigenetic heat map for patient $\beta$S/$\beta$S 
+
+```{r bsbs_epi, fig.height=8, fig.width=6, echo=FALSE, cache=FALSE, dev='png', dpi=300}
+genomicHeatmap(genomicHeatmap2dataframe("../data/tmp/EPI_p1204/main.svg"))
+```
+
+\newpage
+
+Epigenetic heat map for patient $\beta$$0$/$\beta$E  
+
+```{r b0be_epi, fig.height=8, fig.width=6, echo=FALSE, cache=FALSE, dev='png', dpi=300}
+genomicHeatmap(genomicHeatmap2dataframe("../data/tmp/EPI_p1202/main.svg"))
+```
